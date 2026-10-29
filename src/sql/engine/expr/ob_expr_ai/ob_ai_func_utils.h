@@ -241,6 +241,7 @@ public:
   static int get_json_array(ObIAllocator &allocator, ObJsonArray *&array_node);
   static int get_json_string(ObIAllocator &allocator, ObString &str, ObJsonString *&str_node);
   static int get_json_int(ObIAllocator &allocator, int64_t num, ObJsonInt *&int_node);
+  static int get_json_double(ObIAllocator &allocator, double num, ObJsonDouble *&double_node);
   static int get_json_boolean(ObIAllocator &allocator, bool value, ObJsonBoolean *&boolean_node);
   static int get_json_object_form_str(ObIAllocator &allocator, ObString &str, ObJsonObject *&obj_node);
   static int print_json_to_str(ObIAllocator &allocator, ObIJsonBase *base_node, ObString &str);
@@ -330,6 +331,9 @@ public:
                                  ObIJsonBase *&result);
   static int set_string_result(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &res, ObString &res_str);
   static bool is_provider_support_base64(const ObString &provider);
+  // Validate that %embedding is a non-empty json array whose elements are all
+  // numbers, and output its dimension through %dimension.
+  static int check_embedding_array(const ObIJsonBase &embedding, int64_t &dimension);
   static int decode_base64_embedding_array(const ObIJsonBase &embedding_jbase, ObIAllocator &allocator,
                                            const int64_t dimension, float *&vector);
   static int decode_float_embedding_array(const ObIJsonBase &embedding_jbase, ObIAllocator &allocator,
@@ -379,6 +383,12 @@ public:
   static bool is_valid_prompt_object(ObJsonObject* prompt_object);
   static int replace_all_str_args_in_template(ObIAllocator &allocator, ObJsonObject* prompt_object, ObString& replaced_prompt_str);
   static int construct_prompt_object(ObIAllocator &allocator, ObString &template_str, ObJsonArray *args_array, ObJsonObject *&prompt_object);
+  // append a json argument to the args array of a prompt object, the argument is deep copied
+  // into allocator, arg_base must be a json tree node returned by ObJsonExprHelper::get_json_doc
+  static int append_json_arg(ObIAllocator &allocator, ObJsonArray *args_array, ObIJsonBase *arg_base);
+  // get the text of one prompt argument, string arguments keep their origin text and the other
+  // json arguments are printed as json text
+  static int get_arg_text(ObIAllocator &allocator, ObJsonNode *arg_node, ObString &arg_str);
   static constexpr char prompt_template_key[20] = "template";
   static constexpr char prompt_args_key[20] = "args";
 private:

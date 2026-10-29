@@ -37,11 +37,22 @@ public:
                                 int64_t param_num,
                                 common::ObExprTypeCtx &type_ctx) const override;
   static int eval_ai_embed(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &res);
+  // Batch callback. All rows of one batch are merged into a single http request.
+  // Rows with NULL/empty input are skipped (but keep their slot) and produce NULL.
+  static int eval_ai_embed_batch(const ObExpr &expr, ObEvalCtx &ctx,
+                                 const ObBitVector &skip, const int64_t size);
   virtual int cg_expr(ObExprCGCtx &expr_cg_ctx, 
                       const ObRawExpr &raw_expr,
                       ObExpr &rt_expr) const override;
   virtual bool need_rt_ctx() const override { return true; }
 private:
+  // Send one request that carries all %contents and return the embedding json
+  // text for every content, in the same order as %contents.
+  static int call_embedding_batch(common::ObIAllocator &allocator,
+                                  const common::ObString &model_id,
+                                  common::ObArray<common::ObString> &contents,
+                                  const int64_t dimension,
+                                  common::ObArray<common::ObString> &results);
   static constexpr int MODEL_IDX = 0;
   static constexpr int CONTENT_IDX = 1;
   static constexpr int DIM_IDX = 2;
