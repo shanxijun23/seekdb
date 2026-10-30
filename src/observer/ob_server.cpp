@@ -2309,12 +2309,24 @@ static int ai_worker_build_value_sql(const ObAIColumnWorkerTask::AiWorkerTask &t
   int ret = OB_SUCCESS;
   valid = true;
   if (task.result_type_ == 2) {
-    // vector: cast json array text to vector(dim)
-    if (task.vector_dim_ <= 0) {
+    // vector: the embedding output is a json array text which is also a valid vector literal
+    int64_t start = 0;
+    int64_t end = model_result.length();
+    while (start < end && (' ' == model_result.ptr()[start] || '\t' == model_result.ptr()[start]
+                           || '\n' == model_result.ptr()[start] || '\r' == model_result.ptr()[start])) {
+      ++start;
+    }
+    while (end > start && (' ' == model_result.ptr()[end - 1] || '\t' == model_result.ptr()[end - 1]
+                           || '\n' == model_result.ptr()[end - 1] || '\r' == model_result.ptr()[end - 1])) {
+      --end;
+    }
+    if (task.vector_dim_ <= 0 || end - start < 2
+        || '[' != model_result.ptr()[start] || ']' != model_result.ptr()[end - 1]) {
       valid = false;
-    } else if (OB_FAIL(sql.append_fmt("cast("))) {
-    } else if (OB_FAIL(ai_worker_append_str_literal(sql, model_result))) {
-    } else if (OB_FAIL(sql.append_fmt(" as vector(%ld))", task.vector_dim_))) {
+      LOG_WARN("unexpected ai column vector model result", K(model_result), K(task.vector_dim_),
+               K(task.column_id_), K(start), K(end));
+    } else if (OB_FAIL(ai_worker_append_str_literal(sql, ObString(static_cast<int32_t>(end - start),
+                                                                 model_result.ptr() + start)))) {
     }
   } else if (task.result_type_ == 1 || task.result_type_ == 3) {
     if (OB_FAIL(ai_worker_append_str_literal(sql, model_result))) {
@@ -2521,85 +2533,106 @@ int ObAIColumnWorkerTask::process_group(common::ObIArray<AiWorkerTask> &tasks,
     }
   }
 
-  // publish all valid results of this request group in one transaction
-  bool txn_ok = false;
-  bool any_valid = false;
-  for (int64_t i = 0; i < valids.count(); ++i) {
-    if (valids.at(i)) {
-      any_valid = true;
-    }
-  }
   if (OB_SUCC(ret)) {
-    common::ObMySQLTransaction trans;
-    int64_t delete_rows = 0;
-    if (OB_FAIL(trans.start(GCTX.sql_proxy_))) {
-      LOG_WARN("failed to start ai column publish transaction", K(ret));
-    } else {
+    // Collect the valid tasks. All tasks of a request group belong to one row, so we can
+    // publish them with a single UPDATE statement. Using one autocommit statement (instead
+    // of an explicit multi-statement transaction) is required so that the DML/index
+    // machinery (in particular the vector index delta maintenance) sees a plain write.
+    bool any_valid = false;
+    int64_t first_valid = -1;
+    for (int64_t i = start; i < end; ++i) {
+      if (valids.at(i - start)) {
+        any_valid = true;
+        if (first_valid < 0) {
+          first_valid = i;
+        }
+      }
+    }
+    bool published = false;
+    if (any_valid) {
+      AiWorkerTask &first_task = tasks.at(first_valid);
+      ObSqlString update_sql;
+      if (OB_FAIL(update_sql.append("update "))) {
+      } else if (OB_FAIL(ai_worker_append_ident(update_sql, first_task.db_))) {
+      } else if (OB_FAIL(update_sql.append("."))) {
+      } else if (OB_FAIL(ai_worker_append_ident(update_sql, first_task.table_))) {
+      } else if (OB_FAIL(update_sql.append(" set "))) {
+      }
+      bool first_set = true;
       for (int64_t i = start; OB_SUCC(ret) && i < end; ++i) {
         AiWorkerTask &task = tasks.at(i);
         if (!valids.at(i - start)) {
           continue;
         }
-        ObSqlString update_sql;
-        int64_t affected_rows = 0;
-        if (OB_FAIL(update_sql.append("update "))) {
-        } else if (OB_FAIL(ai_worker_append_ident(update_sql, task.db_))) {
-        } else if (OB_FAIL(update_sql.append("."))) {
-        } else if (OB_FAIL(ai_worker_append_ident(update_sql, task.table_))) {
-        } else if (OB_FAIL(update_sql.append(" set "))) {
+        if (!first_set && OB_FAIL(update_sql.append(", "))) {
         } else if (OB_FAIL(ai_worker_append_ident(update_sql, task.result_col_))) {
         } else if (OB_FAIL(update_sql.append(" = "))) {
         } else if (OB_FAIL(update_sql.append(values.at(i - start)))) {
-        } else if (OB_FAIL(update_sql.append(" where "))) {
-        } else if (OB_FAIL(update_sql.append(task.predicate_))) {
-        } else if (OB_FAIL(update_sql.append(" and ("))) {
+        } else {
+          first_set = false;
+        }
+      }
+      if (OB_SUCC(ret)) {
+        if (OB_FAIL(update_sql.append(" where "))) {
+        } else if (OB_FAIL(update_sql.append(first_task.predicate_))) {
+        }
+      }
+      for (int64_t i = start; OB_SUCC(ret) && i < end; ++i) {
+        AiWorkerTask &task = tasks.at(i);
+        if (!valids.at(i - start)) {
+          continue;
+        }
+        if (OB_FAIL(update_sql.append(" and ("))) {
         } else if (OB_FAIL(update_sql.append(task.prompt_expr_))) {
         } else if (OB_FAIL(update_sql.append(") = "))) {
         } else if (OB_FAIL(ai_worker_append_str_literal(update_sql, task.prompt_))) {
-        } else if (OB_FAIL(trans.write(update_sql.ptr(), affected_rows))) {
-        } else {
-          LOG_INFO("ai column result published", K(task.table_id_), K(task.column_id_),
-                   K(task.request_id_), K(affected_rows));
         }
       }
-      if (OB_SUCC(ret)) {
-        // delete task rows only for the columns whose results are being published
+      int64_t affected_rows = 0;
+      int write_ret = OB_SUCCESS;
+      if (OB_SUCC(ret) && OB_FAIL(write_ret = GCTX.sql_proxy_->write(update_sql.ptr(), affected_rows))) {
+        LOG_WARN("ai column publish update failed", K(write_ret), K(update_sql));
+      } else if (OB_SUCC(ret)) {
+        published = true;
+        if (affected_rows > 0) {
+          LOG_INFO("ai column result published", K(first_task.table_id_), K(first_task.request_id_),
+                   K(affected_rows), K(update_sql));
+        } else {
+          LOG_INFO("ai column result is stale, publish skipped", K(first_task.table_id_),
+                   K(first_task.request_id_));
+        }
+      }
+      if (published) {
+        // remove task rows of published columns
+        ObSqlString del_sql;
+        bool first_del = true;
+        if (OB_FAIL(del_sql.append_fmt("delete from oceanbase.__all_ai_column_task "
+                                       "where request_id = %ld and column_id in (",
+                                       first_task.request_id_))) {
+        }
         for (int64_t i = start; OB_SUCC(ret) && i < end; ++i) {
           AiWorkerTask &task = tasks.at(i);
-          ObSqlString del_sql;
           if (!valids.at(i - start)) {
             continue;
           }
-          if (OB_FAIL(del_sql.append_fmt("delete from oceanbase.__all_ai_column_task "
-                                         "where request_id = %ld and column_id = %ld",
-                                         task.request_id_, task.column_id_))) {
-          } else if (OB_FAIL(trans.write(del_sql.ptr(), delete_rows))) {
+          if (!first_del && OB_FAIL(del_sql.append(", "))) {
+          } else if (OB_FAIL(del_sql.append_fmt("%ld", task.column_id_))) {
           } else {
-            LOG_INFO("ai column tasks removed", K(delete_rows), K(task.request_id_),
-                     K(task.column_id_));
+            first_del = false;
           }
         }
-      }
-      if (OB_SUCC(ret)) {
-        if (OB_FAIL(trans.end(true))) {
-          LOG_WARN("failed to commit ai column publish transaction", K(ret));
-        } else {
-          txn_ok = true;
+        int64_t delete_rows = 0;
+        if (OB_SUCC(ret) && OB_FAIL(del_sql.append(")"))) {
+        } else if (OB_SUCC(ret) && OB_FAIL(GCTX.sql_proxy_->write(del_sql.ptr(), delete_rows))) {
+          LOG_WARN("failed to remove published ai column tasks", K(ret), K(del_sql));
+        } else if (OB_SUCC(ret)) {
+          LOG_INFO("ai column tasks removed", K(delete_rows), K(first_task.request_id_));
         }
-      } else {
-        int tmp_ret = trans.end(false);
-        LOG_WARN("rollback ai column publish transaction", K(ret), K(tmp_ret));
       }
     }
-    if (!txn_ok) {
-      ret = OB_SUCCESS;
-    }
-  }
-
-  // tasks that were not published are marked for retry or removed on terminal failure
-  if (OB_SUCC(ret)) {
+    // tasks that were not published are marked for retry or removed on terminal failure
     for (int64_t i = start; OB_SUCC(ret) && i < end; ++i) {
-      if (!txn_ok || !valids.at(i - start)) {
+      if (!published || !valids.at(i - start)) {
         int tmp_ret = mark_task_failure(tasks.at(i), OB_INVALID_DATA, "ai column task failed");
         if (OB_SUCCESS != tmp_ret) {
           LOG_WARN("failed to mark ai column task failed", K(tmp_ret), K(tasks.at(i).request_id_));
@@ -2607,7 +2640,6 @@ int ObAIColumnWorkerTask::process_group(common::ObIArray<AiWorkerTask> &tasks,
       }
     }
   }
-  UNUSED(any_valid);
   return ret;
 }
 

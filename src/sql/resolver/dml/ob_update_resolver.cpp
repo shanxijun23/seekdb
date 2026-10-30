@@ -16,6 +16,10 @@
 
 #define USING_LOG_PREFIX SQL_RESV
 #include "sql/resolver/dml/ob_update_resolver.h"
+#include "share/ob_server_struct.h"
+#include "common/mysqlclient/ob_mysql_proxy.h"
+#include "common/mysqlclient/ob_mysql_result.h"
+#include "sql/resolver/expr/ob_raw_expr_util.h"
 
 namespace oceanbase
 {
@@ -33,6 +37,184 @@ ObUpdateResolver::ObUpdateResolver(ObResolverParams &param)
 ObUpdateResolver::~ObUpdateResolver()
 {
 }
+
+namespace {
+
+struct ObAiColumnAssignMeta
+{
+  ObAiColumnAssignMeta() : column_name_(), deps_() {}
+  ObString column_name_;
+  ObString deps_;
+};
+
+static bool ai_column_is_hidden_ai_col(const share::schema::ObColumnSchemaV2 &col)
+{
+  const ObString &comment = col.get_comment_str();
+  return col.is_hidden() && comment.length() >= 8 && comment.prefix_match(ObString(6, 0, "AICOL|"));
+}
+
+static bool ai_column_contains_table_ai(const share::schema::ObTableSchema &table_schema)
+{
+  bool found = false;
+  share::schema::ObTableSchema::const_column_iterator iter = table_schema.column_begin();
+  for (; !found && OB_NOT_NULL(iter) && iter != table_schema.column_end(); ++iter) {
+    if (OB_NOT_NULL(*iter) && ai_column_is_hidden_ai_col(**iter)) {
+      found = true;
+    }
+  }
+  return found;
+}
+
+static int load_ai_column_assign_meta(ObIAllocator &allocator,
+                                      const uint64_t table_id,
+                                      ObIArray<ObAiColumnAssignMeta> &metas)
+{
+  int ret = OB_SUCCESS;
+  ObSqlString sql;
+  if (OB_FAIL(sql.append_fmt("select column_name, dependencies from oceanbase.__all_ai_column "
+                             "where table_id = %lu", table_id))) {
+  } else {
+    SMART_VAR(ObMySQLProxy::MySQLResult, result) {
+      if (OB_ISNULL(GCTX.sql_proxy_)) {
+        ret = OB_NOT_INIT;
+      } else if (OB_FAIL(GCTX.sql_proxy_->read(result, sql.ptr()))) {
+      } else if (OB_ISNULL(result.get_result())) {
+        ret = OB_ERR_UNEXPECTED;
+      } else {
+        sqlclient::ObMySQLResult *mysql_result = result.get_result();
+        int next_ret = OB_SUCCESS;
+        while (OB_SUCC(ret)) {
+          next_ret = mysql_result->next();
+          if (OB_ITER_END == next_ret) {
+            break;
+          } else if (OB_FAIL(next_ret)) {
+            ret = next_ret;
+            break;
+          } else {
+            ObAiColumnAssignMeta meta;
+            ObString tmp;
+            if (OB_FAIL(mysql_result->get_varchar("column_name", tmp))) {
+            } else if (OB_FAIL(ob_write_string(allocator, tmp, meta.column_name_))) {
+            } else if (OB_FAIL(mysql_result->get_varchar("dependencies", tmp))) {
+            } else if (OB_FAIL(ob_write_string(allocator, tmp, meta.deps_))) {
+            } else if (OB_FAIL(metas.push_back(meta))) {
+            }
+          }
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+static bool ai_column_name_in_set(const ObIArray<ObString> &names, const ObString &target)
+{
+  bool found = false;
+  for (int64_t i = 0; !found && i < names.count(); ++i) {
+    if (names.at(i).length() == target.length()
+        && 0 == strncasecmp(names.at(i).ptr(), target.ptr(), static_cast<size_t>(target.length()))) {
+      found = true;
+    }
+  }
+  return found;
+}
+
+// Append "ai_result_column = NULL" for every AI column whose dependency columns
+// (or rowkey columns) appear in the user SET clause. Keeping the result column in
+// the assignment list is required so that the DML/index machinery (especially the
+// vector index delta maintenance) knows the column value is being changed.
+static int append_ai_column_assignments(ObIAllocator &allocator,
+                                        ObRawExprFactory &expr_factory,
+                                        const ObSQLSessionInfo &session_info,
+                                        const share::schema::ObTableSchema &table_schema,
+                                        const uint64_t table_item_id,
+                                        ObIArray<ObAssignment> &assignments)
+{
+  int ret = OB_SUCCESS;
+  ObSEArray<ObAiColumnAssignMeta, 4> metas;
+  if (!ai_column_contains_table_ai(table_schema)) {
+    // ordinary table, nothing to do
+  } else if (OB_FAIL(load_ai_column_assign_meta(allocator, table_schema.get_table_id(), metas))) {
+    // metadata may not be visible yet at bootstrap/DDL time: ignore
+    LOG_WARN("failed to load ai column metadata for update resolver", K(ret));
+    ret = OB_SUCCESS;
+  }
+  // collect the updated column names of this statement
+  ObSEArray<ObString, 16> updated_names;
+  for (int64_t i = 0; OB_SUCC(ret) && i < assignments.count(); ++i) {
+    const ObAssignment &assign = assignments.at(i);
+    const share::schema::ObColumnSchemaV2 *col_schema = NULL;
+    if (OB_ISNULL(assign.column_expr_)) {
+    } else if (OB_ISNULL(col_schema = table_schema.get_column_schema(
+                             assign.column_expr_->get_column_id()))) {
+    } else if (OB_FAIL(add_var_to_array_no_dup(updated_names, col_schema->get_column_name_str()))) {
+    }
+  }
+  // rowkey columns
+  ObSEArray<uint64_t, 4> rowkey_ids;
+  ObSEArray<ObString, 4> rowkey_names;
+  if (OB_SUCC(ret) && metas.count() > 0) {
+    if (OB_FAIL(table_schema.get_rowkey_column_ids(rowkey_ids))) {
+    } else {
+      for (int64_t i = 0; OB_SUCC(ret) && i < rowkey_ids.count(); ++i) {
+        const share::schema::ObColumnSchemaV2 *pk_schema = table_schema.get_column_schema(rowkey_ids.at(i));
+        if (OB_ISNULL(pk_schema)) {
+          ret = OB_ERR_UNEXPECTED;
+        } else if (OB_FAIL(rowkey_names.push_back(pk_schema->get_column_name_str()))) {
+        }
+      }
+    }
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < metas.count(); ++i) {
+    const ObAiColumnAssignMeta &meta = metas.at(i);
+    bool need_invalidate = false;
+    if (ai_column_name_in_set(updated_names, meta.column_name_)) {
+      // the AI column itself is being updated by the user, leave it alone
+    } else {
+      if (!meta.deps_.empty()) {
+        int64_t start = 0;
+        while (!need_invalidate && start < meta.deps_.length()) {
+          int64_t end = start;
+          while (end < meta.deps_.length() && ',' != meta.deps_.ptr()[end]) {
+            ++end;
+          }
+          ObString dep(static_cast<int32_t>(end - start), meta.deps_.ptr() + start);
+          if (!dep.empty() && ai_column_name_in_set(updated_names, dep)) {
+            need_invalidate = true;
+          }
+          start = end + 1;
+        }
+      }
+      for (int64_t k = 0; !need_invalidate && k < rowkey_names.count(); ++k) {
+        if (ai_column_name_in_set(updated_names, rowkey_names.at(k))) {
+          need_invalidate = true;
+        }
+      }
+      if (need_invalidate) {
+        const share::schema::ObColumnSchemaV2 *result_col = table_schema.get_column_schema(meta.column_name_);
+        ObColumnRefRawExpr *col_expr = NULL;
+        ObRawExpr *null_expr = NULL;
+        if (OB_ISNULL(result_col)) {
+          ret = OB_ERR_UNEXPECTED;
+        } else if (OB_FAIL(ObRawExprUtils::build_column_expr(expr_factory, *result_col,
+                                                             &session_info, col_expr))) {
+        } else if (OB_FAIL(ObRawExprUtils::build_null_expr(expr_factory, null_expr))) {
+        } else {
+          col_expr->set_table_id(table_item_id);
+          ObAssignment assign;
+          assign.column_expr_ = col_expr;
+          assign.expr_ = null_expr;
+          assign.is_implicit_ = true;
+          if (OB_FAIL(assignments.push_back(assign))) {
+          }
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+}  // namespace
 
 int ObUpdateResolver::resolve(const ParseNode &parse_tree)
 {
@@ -355,6 +537,12 @@ int ObUpdateResolver::generate_update_table_info(ObTableAssignment &table_assign
   } else if (OB_FAIL(schema_checker_->get_can_write_index_array(table_item->get_base_table_item().ref_id_,
                                                                 index_tid, gindex_cnt, true))) {
   } else if (OB_FAIL(params_.session_info_->get_binlog_row_image(binlog_row_image))) {
+  } else if (OB_FAIL(append_ai_column_assignments(*allocator_,
+                                                   *params_.expr_factory_,
+                                                   *params_.session_info_,
+                                                   *table_schema,
+                                                   table_assign.table_id_,
+                                                   table_assign.assignments_))) {
   } else if (NULL == (ptr = allocator_->alloc(sizeof(ObUpdateTableInfo)))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
   } else {

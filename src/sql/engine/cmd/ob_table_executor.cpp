@@ -843,10 +843,12 @@ static int ai_column_create_table_triggers(const ObTableSchema &table_schema,
   }
 
   if (OB_SUCC(ret)) {
-    // BEFORE UPDATE: clear results when dependency or rowkey changes
+    // BEFORE UPDATE: clear results when dependency or rowkey changes.
+    // Use a BEGIN/IF block so that touching unrelated columns (e.g. result publish)
+    // does not force a conversion of the provided result value.
     ObSqlString sql;
     if (OB_FAIL(sql.append_fmt("create trigger `%.*s`.`__ai_trg_%lu_bu` before update on `%.*s`.`%.*s` "
-                               "for each row set ",
+                               "for each row begin ",
                                static_cast<int>(db_name.length()), db_name.ptr(), table_id,
                                static_cast<int>(db_name.length()), db_name.ptr(),
                                static_cast<int>(table_name.length()), table_name.ptr()))) {
@@ -855,15 +857,14 @@ static int ai_column_create_table_triggers(const ObTableSchema &table_schema,
       const ObAiColumnMetaRow &meta = metas.at(i);
       ObSqlString cond;
       const ObString &name = meta.column_name_;
-      if (i > 0 && OB_FAIL(sql.append(", "))) {
-      } else if (OB_FAIL(ai_column_invalidation_cond(meta, pk_cols, cond))) {
-      } else if (OB_FAIL(sql.append_fmt("new.`%.*s` = if(%.*s, null, new.`%.*s`)",
-                                        static_cast<int>(name.length()), name.ptr(),
+      if (OB_FAIL(ai_column_invalidation_cond(meta, pk_cols, cond))) {
+      } else if (OB_FAIL(sql.append_fmt("if (%.*s) then set new.`%.*s` = null; end if; ",
                                         static_cast<int>(cond.length()), cond.ptr(),
                                         static_cast<int>(name.length()), name.ptr()))) {
       }
     }
-    if (OB_SUCC(ret) && OB_FAIL(ai_column_exec_sql(sql))) {
+    if (OB_SUCC(ret) && OB_FAIL(sql.append("end"))) {
+    } else if (OB_SUCC(ret) && OB_FAIL(ai_column_exec_sql(sql))) {
     }
   }
 
