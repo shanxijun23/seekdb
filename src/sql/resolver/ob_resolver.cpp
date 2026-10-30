@@ -16,6 +16,11 @@
 
 #define USING_LOG_PREFIX SQL_RESV
 #include "sql/resolver/ob_resolver.h"
+#include "share/ob_server_struct.h"
+#include "common/mysqlclient/ob_mysql_proxy.h"
+#include "common/mysqlclient/ob_mysql_result.h"
+#include "lib/utility/utility.h"
+#include "sql/resolver/dml/ob_select_stmt.h"
 #include "lib/utility/ob_smart_call.h"
 #include "lib/stat/ob_diagnostic_info_guard.h"
 #include "sql/resolver/cmd/ob_alter_system_resolver.h"
@@ -136,6 +141,255 @@ int ObResolver::select_stmt_resolver_func(ObResolverParams &params, const ParseN
   }
   return ret;
 }
+
+namespace {
+
+static int ai_strict_check_column(const uint64_t table_id, const uint64_t column_id)
+{
+  int ret = OB_SUCCESS;
+  ObSqlString meta_sql;
+  if (OB_FAIL(meta_sql.append_fmt("select database_name, table_name, column_name "
+                                  "from oceanbase.__all_ai_column where table_id = %lu and column_id = %lu",
+                                  table_id, column_id))) {
+  } else {
+    SMART_VAR(ObMySQLProxy::MySQLResult, result) {
+      if (OB_ISNULL(GCTX.sql_proxy_)) {
+        ret = OB_NOT_INIT;
+      } else if (OB_FAIL(GCTX.sql_proxy_->read(result, meta_sql.ptr()))) {
+      } else if (OB_ISNULL(result.get_result())) {
+        ret = OB_ERR_UNEXPECTED;
+      } else {
+        sqlclient::ObMySQLResult *mysql_result = result.get_result();
+        int next_ret = mysql_result->next();
+        if (OB_ITER_END == next_ret) {
+          LOG_WARN("ai strict read column is not ai column", K(table_id), K(column_id));
+        } else if (OB_FAIL(next_ret)) {
+          ret = next_ret;
+        } else {
+          ObString db_name;
+          ObString table_name;
+          ObString col_name;
+          if (OB_FAIL(mysql_result->get_varchar(static_cast<int64_t>(0), db_name))) {
+          } else if (OB_FAIL(mysql_result->get_varchar(static_cast<int64_t>(1), table_name))) {
+          } else if (OB_FAIL(mysql_result->get_varchar(static_cast<int64_t>(2), col_name))) {
+          } else {
+            ObSqlString null_sql;
+            if (OB_FAIL(null_sql.append_fmt("select 1 from `%.*s`.`%.*s` where `%.*s` is null limit 1",
+                                        static_cast<int>(db_name.length()), db_name.ptr(),
+                                        static_cast<int>(table_name.length()), table_name.ptr(),
+                                        static_cast<int>(col_name.length()), col_name.ptr()))) {
+            } else {
+              SMART_VAR(ObMySQLProxy::MySQLResult, null_result) {
+                if (OB_FAIL(GCTX.sql_proxy_->read(null_result, null_sql.ptr()))) {
+                } else if (OB_ISNULL(null_result.get_result())) {
+                  ret = OB_ERR_UNEXPECTED;
+                } else {
+                  sqlclient::ObMySQLResult *null_mysql_result = null_result.get_result();
+                  int row_ret = null_mysql_result->next();
+                  if (OB_ITER_END == row_ret) {
+                    // all rows of this AI column are ready
+                  } else if (OB_FAIL(row_ret)) {
+                    ret = row_ret;
+                  } else {
+                    LOG_WARN("ai strict read found unfinished row", K(table_id), K(column_id),
+                             K(db_name), K(table_name), K(col_name));
+                    ret = OB_ERR_AI_COLUMN_UNFINISHED;
+                    LOG_USER_ERROR(OB_ERR_AI_COLUMN_UNFINISHED, table_id, column_id);
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+static bool ai_strict_visited(const ObIArray<const ObDMLStmt *> &visited, const ObDMLStmt *stmt)
+{
+  bool found = false;
+  for (int64_t i = 0; !found && i < visited.count(); ++i) {
+    if (visited.at(i) == stmt) {
+      found = true;
+    }
+  }
+  return found;
+}
+
+static int ai_strict_collect_column_ids(const ObDMLStmt &dml_stmt, ObIArray<uint64_t> &column_ids)
+{
+  int ret = OB_SUCCESS;
+  const ObIArray<ColumnItem> &column_items = dml_stmt.get_column_items();
+  for (int64_t i = 0; OB_SUCC(ret) && i < column_items.count(); ++i) {
+    const ColumnItem &item = column_items.at(i);
+    const ObColumnRefRawExpr *ref_expr = item.get_expr();
+    uint64_t column_id = (NULL != ref_expr) ? ref_expr->get_column_id() : item.column_id_;
+    if (OB_INVALID_ID == column_id) {
+      continue;
+    }
+    bool duplicated = false;
+    for (int64_t k = 0; !duplicated && k < column_ids.count(); ++k) {
+      if (column_ids.at(k) == column_id) {
+        duplicated = true;
+      }
+    }
+    if (!duplicated && OB_FAIL(column_ids.push_back(column_id))) {
+    }
+  }
+  return ret;
+}
+
+static bool ai_strict_column_referenced(const ObIArray<uint64_t> &column_ids, const uint64_t column_id)
+{
+  bool found = false;
+  for (int64_t i = 0; !found && i < column_ids.count(); ++i) {
+    if (column_ids.at(i) == column_id) {
+      found = true;
+    }
+  }
+  return found;
+}
+
+static int ai_strict_has_unfinished_row(const ObString &db_name,
+                                        const ObString &table_name,
+                                        const ObString &column_name,
+                                        bool &unfinished)
+{
+  int ret = OB_SUCCESS;
+  unfinished = false;
+  ObSqlString null_sql;
+  if (OB_FAIL(null_sql.append_fmt("select 1 from `%.*s`.`%.*s` where `%.*s` is null limit 1",
+                                  static_cast<int>(db_name.length()), db_name.ptr(),
+                                  static_cast<int>(table_name.length()), table_name.ptr(),
+                                  static_cast<int>(column_name.length()), column_name.ptr()))) {
+  } else {
+    SMART_VAR(ObMySQLProxy::MySQLResult, null_result) {
+      if (OB_ISNULL(GCTX.sql_proxy_)) {
+        ret = OB_NOT_INIT;
+      } else if (OB_FAIL(GCTX.sql_proxy_->read(null_result, null_sql.ptr()))) {
+      } else if (OB_ISNULL(null_result.get_result())) {
+        ret = OB_ERR_UNEXPECTED;
+      } else {
+        sqlclient::ObMySQLResult *null_mysql_result = null_result.get_result();
+        int row_ret = null_mysql_result->next();
+        if (OB_ITER_END == row_ret) {
+          // all rows of this AI column are ready
+        } else if (OB_FAIL(row_ret)) {
+          ret = row_ret;
+        } else {
+          unfinished = true;
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+static int ai_strict_check_stmt(ObDMLStmt &dml_stmt, ObIArray<const ObDMLStmt *> &visited)
+{
+  int ret = OB_SUCCESS;
+  ObSEArray<uint64_t, 16> referenced_ids;
+  if (OB_FAIL(ai_strict_collect_column_ids(dml_stmt, referenced_ids))) {
+  } else {
+    const ObIArray<TableItem *> &table_items = dml_stmt.get_table_items();
+    for (int64_t i = 0; OB_SUCC(ret) && i < table_items.count(); ++i) {
+      const TableItem *table_item = table_items.at(i);
+      if (OB_ISNULL(table_item) || !table_item->is_basic_table()) {
+        continue;
+      }
+      uint64_t table_id = table_item->get_base_table_item().ref_id_;
+      if (OB_INVALID_ID == table_id) {
+        table_id = table_item->table_id_;
+      }
+      if (OB_INVALID_ID == table_id) {
+        continue;
+      }
+      ObSqlString meta_sql;
+      if (OB_FAIL(meta_sql.append_fmt("select column_id, database_name, table_name, column_name "
+                                      "from oceanbase.__all_ai_column where table_id = %lu", table_id))) {
+      } else {
+        SMART_VAR(ObMySQLProxy::MySQLResult, meta_result) {
+          if (OB_ISNULL(GCTX.sql_proxy_)) {
+            ret = OB_NOT_INIT;
+          } else if (OB_FAIL(GCTX.sql_proxy_->read(meta_result, meta_sql.ptr()))) {
+          } else if (OB_ISNULL(meta_result.get_result())) {
+            ret = OB_ERR_UNEXPECTED;
+          } else {
+            sqlclient::ObMySQLResult *meta_mysql_result = meta_result.get_result();
+            int next_ret = OB_SUCCESS;
+            while (OB_SUCC(ret)) {
+              next_ret = meta_mysql_result->next();
+              if (OB_ITER_END == next_ret) {
+                break;
+              } else if (OB_FAIL(next_ret)) {
+                ret = next_ret;
+                break;
+              } else {
+                int64_t column_id_int = 0;
+                ObString db_name;
+                ObString table_name;
+                ObString column_name;
+                bool unfinished = false;
+                if (OB_FAIL(meta_mysql_result->get_int(static_cast<int64_t>(0), column_id_int))) {
+                } else if (!ai_strict_column_referenced(referenced_ids,
+                                                        static_cast<uint64_t>(column_id_int))) {
+                  // this AI column is not referenced by the statement
+                } else if (OB_FAIL(meta_mysql_result->get_varchar(static_cast<int64_t>(1), db_name))) {
+                } else if (OB_FAIL(meta_mysql_result->get_varchar(static_cast<int64_t>(2), table_name))) {
+                } else if (OB_FAIL(meta_mysql_result->get_varchar(static_cast<int64_t>(3), column_name))) {
+                } else if (OB_FAIL(ai_strict_has_unfinished_row(db_name, table_name, column_name,
+                                                                unfinished))) {
+                } else if (unfinished) {
+                  LOG_WARN("ai column read is rejected by strict read mode", K(table_id),
+                           K(column_id_int));
+                  ret = OB_ERR_AI_COLUMN_UNFINISHED;
+                  LOG_USER_ERROR(OB_ERR_AI_COLUMN_UNFINISHED, table_id,
+                                 static_cast<uint64_t>(column_id_int));
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  const ObIArray<ObQueryRefRawExpr *> &subquery_exprs = dml_stmt.get_subquery_exprs();
+  for (int64_t i = 0; OB_SUCC(ret) && i < subquery_exprs.count(); ++i) {
+    ObDMLStmt *ref_stmt = NULL;
+    if (OB_ISNULL(ref_stmt = subquery_exprs.at(i)->get_ref_stmt())) {
+    } else if (ai_strict_visited(visited, ref_stmt)) {
+    } else if (OB_FAIL(visited.push_back(ref_stmt))) {
+    } else if (OB_FAIL(ai_strict_check_stmt(*ref_stmt, visited))) {
+    }
+  }
+  return ret;
+}
+
+static int check_ai_column_strict_read(ObResolverParams &params, ObStmt &stmt)
+{
+  int ret = OB_SUCCESS;
+  bool strict_read = false;
+  stmt::StmtType stmt_type = stmt.get_stmt_type();
+  if (stmt::T_SELECT != stmt_type && stmt::T_UPDATE != stmt_type && stmt::T_DELETE != stmt_type) {
+  } else if (OB_ISNULL(params.session_info_)) {
+  } else if (OB_FAIL(params.session_info_->get_sys_variable(
+                 share::SYS_VAR_AI_COLUMN_STRICT_READ, strict_read))) {
+    LOG_WARN("failed to get ai column strict read variable", K(ret));
+    ret = OB_SUCCESS;
+  } else if (!strict_read) {
+  } else {
+    ObDMLStmt &dml_stmt = static_cast<ObDMLStmt &>(stmt);
+    ObSEArray<const ObDMLStmt *, 16> visited;
+    if (OB_FAIL(visited.push_back(&dml_stmt))) {
+    } else if (OB_FAIL(ai_strict_check_stmt(dml_stmt, visited))) {
+    }
+  }
+  return ret;
+}
+
+}  // namespace
 
 int ObResolver::resolve(IsPrepared if_prepared, const ParseNode &parse_tree, ObStmt *&stmt)
 {
@@ -639,6 +893,11 @@ int ObResolver::resolve(IsPrepared if_prepared, const ParseNode &parse_tree, ObS
       ObDMLStmt *dml_stmt = static_cast<ObDMLStmt*>(stmt);
       ObRawExprWrapEnumSet enum_set_wrapper(*params_.expr_factory_, params_.session_info_);
       if (OB_FAIL(enum_set_wrapper.wrap_enum_set(*dml_stmt))) {
+      }
+    }
+
+    if (OB_SUCC(ret) && stmt->is_dml_stmt() && !stmt->is_explain_stmt()) {
+      if (OB_FAIL(check_ai_column_strict_read(params_, *stmt))) {
       }
     }
 

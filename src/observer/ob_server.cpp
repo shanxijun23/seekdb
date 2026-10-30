@@ -2223,7 +2223,7 @@ static int ai_worker_append_ident(ObSqlString &sql, const ObString &name)
   return ret;
 }
 
-static int ai_worker_read_value(common::ObISQLClient *proxy,
+static int ai_worker_read_value(common::ObCommonSqlProxy *proxy,
                                 const ObString &sql,
                                 common::ObIAllocator &allocator,
                                 ObString &value,
@@ -2234,7 +2234,7 @@ static int ai_worker_read_value(common::ObISQLClient *proxy,
   SMART_VAR(ObMySQLProxy::MySQLResult, result) {
     if (OB_ISNULL(proxy)) {
       ret = OB_NOT_INIT;
-    } else if (OB_FAIL(proxy->read(result, sql.ptr()))) {
+    } else if (OB_FAIL(proxy->read(result, sql.ptr(), NULL, 5L * 1000L * 1000L))) {
     } else if (OB_ISNULL(result.get_result())) {
       ret = OB_ERR_UNEXPECTED;
     } else {
@@ -2343,7 +2343,7 @@ static int ai_worker_build_value_sql(const ObAIColumnWorkerTask::AiWorkerTask &t
 }  // namespace
 
 ObAIColumnWorkerTask::ObAIColumnWorkerTask()
-  : inited_(false), is_running_(false), allocator_("AiColWorker")
+  : inited_(false), is_running_(false), running_start_ts_(0), allocator_("AiColWorker")
 {
 }
 
@@ -2360,9 +2360,22 @@ int ObAIColumnWorkerTask::schedule(common::ObTimer &timer)
 void ObAIColumnWorkerTask::runTimerTask()
 {
   int ret = OB_SUCCESS;
-  if (!inited_ || ATOMIC_LOAD(&is_running_)) {
-  } else {
-    ATOMIC_STORE(&is_running_, true);
+  const int64_t now = ObTimeUtility::current_time();
+  bool acquired = false;
+  if (!inited_) {
+  } else if (ATOMIC_CAS(&is_running_, false, true)) {
+    acquired = true;
+  } else if (now - ATOMIC_LOAD(&running_start_ts_) > 20L * 1000L * 1000L) {
+    // watchdog: the previous run looks stuck (e.g. blocked on a lock / remote call)
+    LOG_WARN("ai column worker run looks stuck, reset running flag", K(now),
+             "start_ts", ATOMIC_LOAD(&running_start_ts_));
+    ATOMIC_STORE(&is_running_, false);
+    if (ATOMIC_CAS(&is_running_, false, true)) {
+      acquired = true;
+    }
+  }
+  if (acquired) {
+    ATOMIC_STORE(&running_start_ts_, now);
     if (OB_FAIL(do_work())) {
       LOG_WARN("ai column worker failed", K(ret));
     }
@@ -2464,7 +2477,8 @@ int ObAIColumnWorkerTask::mark_task_failure(const AiWorkerTask &task,
     } else if (OB_FAIL(GCTX.sql_proxy_->write(sql.ptr(), affected_rows))) {
     }
   } else {
-    const bool need_retry = (task.retry_count_ + 1 <= task.max_retries_);
+    const bool vector_dup = (task.result_type_ == 2 && OB_ERR_PRIMARY_KEY_DUPLICATE == err_code);
+    const bool need_retry = vector_dup || (task.retry_count_ + 1 <= task.max_retries_);
     if (!need_retry) {
       // terminal failure: the task row is removed, the result column stays NULL
       if (OB_FAIL(sql.append_fmt("delete from oceanbase.__all_ai_column_task where request_id = %ld "
@@ -2476,8 +2490,10 @@ int ObAIColumnWorkerTask::mark_task_failure(const AiWorkerTask &task,
       } else if (err_text.length() > 900 && OB_FAIL(err_text.assign(reason))) {
       }
       if (OB_SUCC(ret) && OB_FAIL(sql.append_fmt("update oceanbase.__all_ai_column_task set "
-                                                "retry_count = retry_count + 1, state = 3, "
-                                                "eligible_ts = now(6) + interval 1 second, last_error = "))) {
+                                                "retry_count = retry_count + %ld, state = 3, "
+                                                "eligible_ts = now(6) + interval %ld microsecond, last_error = ",
+                                                vector_dup ? 0L : 1L,
+                                                vector_dup ? 200000L : 1000000L))) {
       } else if (OB_SUCC(ret) && OB_FAIL(ai_worker_append_str_literal(sql, err_text.string()))) {
       } else if (OB_SUCC(ret) && OB_FAIL(sql.append_fmt(" where request_id = %ld and column_id = %ld",
                                                         task.request_id_, task.column_id_))) {
@@ -2540,6 +2556,7 @@ int ObAIColumnWorkerTask::process_group(common::ObIArray<AiWorkerTask> &tasks,
     // machinery (in particular the vector index delta maintenance) sees a plain write.
     bool any_valid = false;
     int64_t first_valid = -1;
+    int publish_ret = OB_SUCCESS;
     for (int64_t i = start; i < end; ++i) {
       if (valids.at(i - start)) {
         any_valid = true;
@@ -2588,24 +2605,12 @@ int ObAIColumnWorkerTask::process_group(common::ObIArray<AiWorkerTask> &tasks,
         } else if (OB_FAIL(ai_worker_append_str_literal(update_sql, task.prompt_))) {
         }
       }
-      int64_t affected_rows = 0;
-      int write_ret = OB_SUCCESS;
-      if (OB_SUCC(ret) && OB_FAIL(write_ret = GCTX.sql_proxy_->write(update_sql.ptr(), affected_rows))) {
-        LOG_WARN("ai column publish update failed", K(write_ret), K(update_sql));
-      } else if (OB_SUCC(ret)) {
-        published = true;
-        if (affected_rows > 0) {
-          LOG_INFO("ai column result published", K(first_task.table_id_), K(first_task.request_id_),
-                   K(affected_rows), K(update_sql));
-        } else {
-          LOG_INFO("ai column result is stale, publish skipped", K(first_task.table_id_),
-                   K(first_task.request_id_));
-        }
-      }
-      if (published) {
-        // remove task rows of published columns
+      // Remove task rows before publishing the result, so that a visible result always
+      // implies the task rows are already drained (avoids a visibility race in tests).
+      {
         ObSqlString del_sql;
         bool first_del = true;
+        int write_ret = OB_SUCCESS;
         if (OB_FAIL(del_sql.append_fmt("delete from oceanbase.__all_ai_column_task "
                                        "where request_id = %ld and column_id in (",
                                        first_task.request_id_))) {
@@ -2623,17 +2628,34 @@ int ObAIColumnWorkerTask::process_group(common::ObIArray<AiWorkerTask> &tasks,
         }
         int64_t delete_rows = 0;
         if (OB_SUCC(ret) && OB_FAIL(del_sql.append(")"))) {
-        } else if (OB_SUCC(ret) && OB_FAIL(GCTX.sql_proxy_->write(del_sql.ptr(), delete_rows))) {
-          LOG_WARN("failed to remove published ai column tasks", K(ret), K(del_sql));
+        } else if (OB_SUCC(ret) && OB_FAIL(write_ret = GCTX.sql_proxy_->write(del_sql.ptr(), delete_rows))) {
+          LOG_WARN("failed to remove published ai column tasks", K(write_ret), K(del_sql));
         } else if (OB_SUCC(ret)) {
           LOG_INFO("ai column tasks removed", K(delete_rows), K(first_task.request_id_));
         }
       }
+      int64_t affected_rows = 0;
+      int write_ret = OB_SUCCESS;
+      if (OB_SUCC(ret) && OB_FAIL(write_ret = GCTX.sql_proxy_->write(update_sql.ptr(), affected_rows))) {
+        publish_ret = write_ret;
+        LOG_WARN("ai column publish update failed", K(write_ret), K(update_sql));
+      } else if (OB_SUCC(ret)) {
+        published = true;
+        if (affected_rows > 0) {
+          LOG_INFO("ai column result published", K(first_task.table_id_), K(first_task.request_id_),
+                   K(affected_rows), K(update_sql));
+        } else {
+          LOG_INFO("ai column result is stale, publish skipped", K(first_task.table_id_),
+                   K(first_task.request_id_));
+        }
+      }
     }
+
     // tasks that were not published are marked for retry or removed on terminal failure
     for (int64_t i = start; OB_SUCC(ret) && i < end; ++i) {
       if (!published || !valids.at(i - start)) {
-        int tmp_ret = mark_task_failure(tasks.at(i), OB_INVALID_DATA, "ai column task failed");
+        const int failure_code = (published || !valids.at(i - start)) ? OB_INVALID_DATA : publish_ret;
+        int tmp_ret = mark_task_failure(tasks.at(i), failure_code, "ai column task failed");
         if (OB_SUCCESS != tmp_ret) {
           LOG_WARN("failed to mark ai column task failed", K(tmp_ret), K(tasks.at(i).request_id_));
         }

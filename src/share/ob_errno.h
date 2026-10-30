@@ -1208,6 +1208,7 @@ constexpr int OB_AI_FUNC_ENDPOINT_NOT_FOUND = -11112;
 constexpr int OB_AI_FUNC_ENDPOINT_EXISTS = -11113;
 constexpr int OB_AI_FUNC_PARAM_EMPTY = -11114;
 constexpr int OB_AI_FUNC_PARAM_INVALID = -11115;
+constexpr int OB_ERR_AI_COLUMN_UNFINISHED = -11120;
 constexpr int OB_AI_FUNC_PARAM_VALUE_INVALID = -11116;
 constexpr int OB_AI_FUNC_PARAM_TYPE_INVALID = -11117;
 constexpr int OB_AI_FUNC_MODEL_NOT_FOUND = -11118;
@@ -2757,6 +2758,7 @@ constexpr int OB_ERR_INVALID_DATE_MSG_FMT_V2 = -4219;
 #define OB_AI_FUNC_ENDPOINT_EXISTS__USER_ERROR_MSG "This ai model endpoint \'%.*s\' is already exists"
 #define OB_AI_FUNC_PARAM_EMPTY__USER_ERROR_MSG "The param \'%.*s\' is empty or null"
 #define OB_AI_FUNC_PARAM_INVALID__USER_ERROR_MSG "The param \'%.*s\' is invalid"
+#define OB_ERR_AI_COLUMN_UNFINISHED__USER_ERROR_MSG "AI column has unfinished tasks for table_id=%ld, column_id=%ld"
 #define OB_AI_FUNC_PARAM_VALUE_INVALID__USER_ERROR_MSG "The value of param \'%.*s\' is invalid"
 #define OB_AI_FUNC_PARAM_TYPE_INVALID__USER_ERROR_MSG "This type of param \'%.*s\' is invalid, should be %.*s"
 #define OB_AI_FUNC_MODEL_NOT_FOUND__USER_ERROR_MSG "This AI model \'%.*s\' was not found"

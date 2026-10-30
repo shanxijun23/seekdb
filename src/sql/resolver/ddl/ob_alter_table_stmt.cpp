@@ -30,13 +30,14 @@ namespace sql
 ObAlterTableStmt::ObAlterTableStmt(common::ObIAllocator *name_pool)
     : ObTableStmt(name_pool, stmt::T_ALTER_TABLE), is_comment_table_(false),
       is_alter_system_(false), fts_arg_allocator_(nullptr), is_alter_triggers_(false),
-      alter_table_action_count_(0)
+      alter_table_action_count_(0), is_ai_column_retry_(false), ai_retry_column_id_(0)
 {
 }
 
 ObAlterTableStmt::ObAlterTableStmt()
     : ObTableStmt(stmt::T_ALTER_TABLE), is_comment_table_(false), is_alter_system_(false),
-      fts_arg_allocator_(nullptr), is_alter_triggers_(false), alter_table_action_count_(0)
+      fts_arg_allocator_(nullptr), is_alter_triggers_(false), alter_table_action_count_(0),
+      is_ai_column_retry_(false), ai_retry_column_id_(0)
 {
 }
 
@@ -142,6 +143,25 @@ void ObAlterTableStmt::set_lock_priority()
   if (config::enable_lock_priority()) {
     alter_table_arg_.lock_priority_ = ObTableLockPriority::HIGH1;
   }
+}
+
+int ObAlterTableStmt::set_ai_column_retry(common::ObIAllocator &allocator,
+                                        const common::ObString &db_name,
+                                        const common::ObString &table_name,
+                                        const common::ObString &column_name,
+                                        const uint64_t column_id,
+                                        const common::ObString &where_sql)
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(ob_write_string(allocator, db_name, ai_retry_database_name_))) {
+  } else if (OB_FAIL(ob_write_string(allocator, table_name, ai_retry_table_name_))) {
+  } else if (OB_FAIL(ob_write_string(allocator, column_name, ai_retry_column_name_))) {
+  } else if (OB_FAIL(ob_write_string(allocator, where_sql, ai_retry_where_sql_))) {
+  } else {
+    ai_retry_column_id_ = column_id;
+    is_ai_column_retry_ = true;
+  }
+  return ret;
 }
 
 } //namespace sql

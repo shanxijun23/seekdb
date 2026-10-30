@@ -1474,7 +1474,7 @@ int ObJoinOrder::process_vec_index_info(const ObDMLStmt *stmt,
                                                                  stmt))) {
     } else {
       access_path.vec_idx_info_.inited_ = true;
-      access_path.vec_idx_info_.vec_extra_info_.set_row_count(table_meta_info_.table_row_count_);
+      access_path.vec_idx_info_.vec_extra_info_.set_row_count(table_meta_info_.table_row_count_ + 1);
     }
     // set vec_extra_info_
     if (OB_FAIL(ret)) {
@@ -1495,7 +1495,7 @@ int ObJoinOrder::process_vec_index_info(const ObDMLStmt *stmt,
                                                                    stmt))) {
       } else {
         access_path.domain_idx_info_.set_domain_idx_type(DomainIndexType::VEC_INDEX);
-        access_path.vec_idx_info_.vec_extra_info_.set_row_count(table_meta_info_.table_row_count_);
+        access_path.vec_idx_info_.vec_extra_info_.set_row_count(table_meta_info_.table_row_count_ + 1);
       }
     } // not weak read
 
@@ -5489,7 +5489,7 @@ int ObJoinOrder::compute_vec_idx_path_relationship(const AccessPath &first_path,
 
   final_res = relation == DominateRelation::OBJ_LEFT_DOMINATE ?
               const_cast<AccessPath*>(&first_path) : const_cast<AccessPath*>(&second_path);
-  final_res->vec_idx_info_.vec_extra_info_.set_row_count(table_meta_info_.table_row_count_);
+  final_res->vec_idx_info_.vec_extra_info_.set_row_count(table_meta_info_.table_row_count_ + 1);
   return ret;
 }
 

@@ -259,6 +259,7 @@ private:
   static constexpr int64_t SCHEDULE_PERIOD = 100L * 1000L;
   bool inited_;
   bool is_running_;
+  int64_t running_start_ts_;
   common::ObArenaAllocator allocator_;
 };
 

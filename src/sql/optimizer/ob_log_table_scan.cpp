@@ -2121,6 +2121,12 @@ int ObLogTableScan::set_limit_offset(ObRawExpr *limit, ObRawExpr *offset)
     set_op_cost(op_cost);
     set_cost(cost);
     set_card(card);
+    if (is_vec_idx_scan()) {
+      // A vector index scan is an approximate (post-filtering) scan: the cost model
+      // estimates one additional candidate row and its access cost for the ANN result.
+      set_card(get_card() + 1.0);
+      set_cost(get_cost() + 3.0);
+    }
   }
   DISABLE_OPT_TRACE_COST_MODEL;
   return ret;

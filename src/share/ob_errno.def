@@ -1211,6 +1211,7 @@ DEFINE_ERROR(OB_ERR_REGEXP_MIXED, -5823, -1, "HY000", "character widths of regex
 DEFINE_ERROR(OB_ERR_REGEXP_BADOPT, -5824, -1, "HY000", "invalid embedded option in regular expression");
 DEFINE_ERROR(OB_ERR_REGEXP_ETOOBIG, -5825, -1, "HY000", "nfa has too many states in regular expression, may be the regular expression too long");
 DEFINE_ERROR(OB_NOT_SUPPORTED_ROWID_TYPE, -5826, -1, "HY000", "ROWID for tables without primary key is not implemented");
+DEFINE_ERROR(OB_ERR_AI_COLUMN_UNFINISHED, -11120, -1, "HY000", "AI column has unfinished tasks for table_id=%ld, column_id=%ld");
 DEFINE_ERROR(OB_ERR_PARALLEL_DDL_CONFLICT, -5827, -1, "HY000", "the definition of relative objects have been modified, please check and retry");
 DEFINE_ERROR(OB_ERR_SUBSCRIPT_BEYOND_COUNT, -5828, -1, "HY000", "Subscript beyond count");
 DEFINE_ERROR(OB_ERR_NOT_PARTITIONED, -5829, -1, "HY000", "PARTITION () clause on non partitioned table");

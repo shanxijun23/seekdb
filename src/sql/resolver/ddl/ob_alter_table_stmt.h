@@ -104,6 +104,19 @@ public:
     alter_table_arg_.lock_session_create_ts_ = create_ts;
   }
   void set_lock_priority();
+  // AI COLUMN ... RETRY metadata (handled by the executor directly, no DDL op needed)
+  bool is_ai_column_retry() const { return is_ai_column_retry_; }
+  int set_ai_column_retry(common::ObIAllocator &allocator,
+                          const common::ObString &db_name,
+                          const common::ObString &table_name,
+                          const common::ObString &column_name,
+                          const uint64_t column_id,
+                          const common::ObString &where_sql);
+  const common::ObString &get_ai_retry_database_name() const { return ai_retry_database_name_; }
+  const common::ObString &get_ai_retry_table_name() const { return ai_retry_table_name_; }
+  const common::ObString &get_ai_retry_column_name() const { return ai_retry_column_name_; }
+  const common::ObString &get_ai_retry_where_sql() const { return ai_retry_where_sql_; }
+  uint64_t get_ai_retry_column_id() const { return ai_retry_column_id_; }
 private:
   obcall::ObAlterTableArg alter_table_arg_;
   bool is_comment_table_;
@@ -114,6 +127,12 @@ private:
   obcall::ObAlterTriggerArg tg_arg_;
   uint64_t alter_table_action_count_;
   obcall::ObExchangePartitionArg exchange_partition_arg_;
+  bool is_ai_column_retry_;
+  uint64_t ai_retry_column_id_;
+  common::ObString ai_retry_database_name_;
+  common::ObString ai_retry_table_name_;
+  common::ObString ai_retry_column_name_;
+  common::ObString ai_retry_where_sql_;
 };
 
 inline int ObAlterTableStmt::set_tz_info_wrap(const common::ObTimeZoneInfoWrap &tz_info_wrap)

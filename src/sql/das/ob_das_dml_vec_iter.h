@@ -55,7 +55,8 @@ protected:
       const int64_t vec_id_idx,
       const int64_t vector_idx,
       int64_t &vec_id,
-      ObString &vector);
+      ObString &vector,
+      bool &is_null);
 private:
   virtual int generate_domain_rows(const ObChunkDatumStore::StoredRow *store_row) override;
   int generate_vec_delta_buff_row(common::ObIAllocator &allocator,

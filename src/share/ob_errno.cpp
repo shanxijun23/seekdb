@@ -13760,6 +13760,15 @@ static const _error _error_OB_ERR_FT_COLUMN_NOT_INDEXED = {
       .str_error             = "Can't find FULLTEXT index matching the column list",
       .str_user_error        = "Can't find FULLTEXT index matching the column list"
 };
+static const _error _error_OB_ERR_AI_COLUMN_UNFINISHED = {
+      .error_name            = "OB_ERR_AI_COLUMN_UNFINISHED",
+      .error_cause           = "Internal Error",
+      .error_solution        = "Contact OceanBase Support",
+      .mysql_errno           = -1,
+      .sqlstate              = "HY000",
+      .str_error             = "AI column has unfinished tasks for table_id=%ld, column_id=%ld",
+      .str_user_error        = "AI column has unfinished tasks for table_id=%ld, column_id=%ld"
+};
 static const _error _error_OB_ERR_CANT_UPDATE_TABLE_IN_CREATE_TABLE_SELECT = {
       .error_name            = "OB_ERR_CANT_UPDATE_TABLE_IN_CREATE_TABLE_SELECT",
       .error_cause           = "Internal Error",
@@ -15481,6 +15490,7 @@ struct ObStrErrorInit
     _errors[-OB_CANNOT_USER_IF_EXISTS] = &_error_OB_CANNOT_USER_IF_EXISTS;
     _errors[-OB_ERR_ILLEGAL_USER_VAR] = &_error_OB_ERR_ILLEGAL_USER_VAR;
     _errors[-OB_ERR_FT_COLUMN_NOT_INDEXED] = &_error_OB_ERR_FT_COLUMN_NOT_INDEXED;
+    _errors[-OB_ERR_AI_COLUMN_UNFINISHED] = &_error_OB_ERR_AI_COLUMN_UNFINISHED;
     _errors[-OB_ERR_CANT_UPDATE_TABLE_IN_CREATE_TABLE_SELECT] = &_error_OB_ERR_CANT_UPDATE_TABLE_IN_CREATE_TABLE_SELECT;
     _errors[-OB_ERR_PS_NO_RECURSION] = &_error_OB_ERR_PS_NO_RECURSION;
     _errors[-OB_ERR_PARTITION_EXCHANGE_PART_TABLE] = &_error_OB_ERR_PARTITION_EXCHANGE_PART_TABLE;

@@ -51,8 +51,16 @@ int ObVecIndexDMLIterator::generate_domain_rows(const ObChunkDatumStore::StoredR
     if (OB_FAIL(get_vector_index_column_idxs(vec_id_idx, type_idx, vector_idx))) {
     }
     for (int i = 0; OB_SUCC(ret) && i < row_cnt; i++) {
+      bool vec_is_null = false;
       if (!is_update_ && OB_FAIL(get_vec_data(store_row, vec_id_idx, vector_idx, vec_id, vector))) {
-      } else if (is_update_ && OB_FAIL(get_vec_data_for_update(store_row, vec_id_idx, vector_idx, vec_id, vector))) {
+      } else if (is_update_ && OB_FAIL(get_vec_data_for_update(store_row, vec_id_idx, vector_idx, vec_id, vector, vec_is_null))) {
+      } else if (is_update && is_old_row_ && (vec_is_null || vector.empty())) {
+        // Old vector is already NULL/empty (it has been invalidated before): there is no
+        // index entry to delete. Emitting another 'D' delta row would conflict with the
+        // delete marker that the previous invalidation already produced.
+        LOG_WARN("ai column vector old row is null, skip delete marker", K(vec_id),
+                 K(is_old_row_), "vec_len", vector.length(), K(vec_is_null));
+        is_old_row_ = !is_old_row_;
       } else if (OB_FAIL(generate_vec_delta_buff_row(allocator_, store_row, vec_id_idx, type_idx, vector_idx, vec_id, vector, rows_))) {
       } else if (is_update) {
         is_old_row_ = !is_old_row_;
@@ -98,7 +106,8 @@ int ObVecIndexDMLIterator::get_vec_data_for_update(
     const int64_t vec_id_idx,
     const int64_t vector_idx,
     int64_t &vec_id,
-    ObString &vector)
+    ObString &vector,
+    bool &is_null)
 {
   int ret = OB_SUCCESS;
   const uint64_t rowkey_col_cnt = das_ctdef_->table_param_.get_data_table().get_rowkey_column_num();
@@ -116,6 +125,8 @@ int ObVecIndexDMLIterator::get_vec_data_for_update(
     // get vec data
     const int64_t vector_old_proj_idx = das_ctdef_->old_row_projector_.at(vector_idx);
     const int64_t vector_new_proj_idx = das_ctdef_->new_row_projector_.at(vector_idx);
+    is_null = is_old_row_ ? store_row->cells()[vector_old_proj_idx].is_null()
+                          : store_row->cells()[vector_new_proj_idx].is_null();
     vector = is_old_row_ ? store_row->cells()[vector_old_proj_idx].get_string()
                          : store_row->cells()[vector_new_proj_idx].get_string();
     // get vec data without lob

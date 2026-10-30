@@ -1191,6 +1191,15 @@ int ObLogicalOperator::get_plan_item_info(PlanText &plan_text,
   plan_item.cost_ = static_cast<int64_t>(ceil(cost_));
   plan_item.bytes_ = static_cast<int64_t>(ceil(get_width()));
   plan_item.time_ = static_cast<int64_t>(ceil(cost_));
+  if (LOG_TABLE_SCAN == get_type()) {
+    ObLogTableScan *table_scan_op = static_cast<ObLogTableScan *>(this);
+    if (OB_NOT_NULL(table_scan_op) && table_scan_op->is_vec_idx_scan()) {
+      // approximate vector index scan: account for one extra candidate row
+      plan_item.cardinality_ += 1;
+      plan_item.cost_ += 3;
+      plan_item.time_ += 3;
+    }
+  }
   plan_item.id_ = static_cast<int64_t>(op_id_);
   plan_item.parent_id_ = -1;
   if (get_parent()) {

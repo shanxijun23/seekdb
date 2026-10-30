@@ -3009,6 +3009,15 @@ int ObLSTabletService::insert_tablet_rows(
                                  *run_ctx.col_descs_,
                                  rows_info))) {
       if (OB_ERR_PRIMARY_KEY_DUPLICATE == ret) {
+        if (OB_NOT_NULL(run_ctx.dml_param_.table_param_)
+            && run_ctx.dml_param_.table_param_->get_data_table().is_vector_delta_buffer()) {
+          // The vector index delta buffer keeps append-only delete/insert markers keyed by
+          // (vid, type). Re-emitting the same delete marker is harmless for the refresh
+          // pipeline, so treat the duplicate as success instead of failing the whole DML.
+          ret = OB_SUCCESS;
+        }
+      }
+      if (OB_ERR_PRIMARY_KEY_DUPLICATE == ret) {
         blocksstable::ObDatumRowkey &duplicate_rowkey = rows_info.get_conflict_rowkey();
 #ifndef OB_BUILD_PACKAGE
         if (table.is_fts_index()) {

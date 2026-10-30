@@ -25,6 +25,10 @@
 #include "sql/session/ob_local_session_var.h"
 #include "query/command/ob_root_command_service.h"
 #include "query/vector/ob_vector_index_util.h"
+#include "share/ob_server_struct.h"
+#include "common/mysqlclient/ob_mysql_proxy.h"
+#include "common/mysqlclient/ob_mysql_result.h"
+#include "lib/utility/utility.h"
 
 namespace oceanbase
 {
@@ -151,6 +155,8 @@ int ObAlterTableResolver::resolve(const ParseNode &parse_tree)
     //resolve action list
     if (OB_SUCCESS == ret && NULL != parse_tree.children_[ACTION_LIST]){
       if (OB_FAIL(resolve_action_list(*(parse_tree.children_[ACTION_LIST])))) {
+      } else if (alter_table_stmt->is_ai_column_retry()) {
+        // AI COLUMN RETRY is executed directly by the ALTER TABLE executor, skip normal DDL checks
       } else if (OB_FAIL(set_table_options())) {
       } else if (OB_FAIL(check_semistruct_encoding_type(*table_schema_, alter_table_stmt->get_alter_table_schema()))) {
       } else {
@@ -344,6 +350,234 @@ int ObAlterTableResolver::check_alter_column_schemas_valid(ObAlterTableStmt &stm
   return ret;
 }
 
+namespace {
+
+static int ai_retry_print_quoted_string(ObSqlString &sql, const ObString &str)
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(sql.append("'"))) {
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < str.length(); ++i) {
+    const char ch = str.ptr()[i];
+    if ('\'' == ch || '\\' == ch) {
+      if (OB_FAIL(sql.append_fmt("\\%c", ch))) {
+      }
+    } else if (OB_FAIL(sql.append_fmt("%c", ch))) {
+    }
+  }
+  if (OB_SUCC(ret) && OB_FAIL(sql.append("'"))) {
+  }
+  return ret;
+}
+
+static int ai_retry_print_ident(ObSqlString &sql, const ObString &name)
+{
+  return sql.append_fmt("`%.*s`", static_cast<int>(name.length()), name.ptr());
+}
+
+static int ai_retry_print_expr(const ParseNode *node, const ObString &column_name, ObSqlString &sql);
+
+static int ai_retry_print_expr_list(const ParseNode *node, const ObString &column_name, ObSqlString &sql)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(node)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (T_EXPR_LIST == node->type_ || T_LINK_NODE == node->type_ || T_OP_ROW == node->type_) {
+    bool first = true;
+    for (int64_t i = 0; OB_SUCC(ret) && i < node->num_child_; ++i) {
+      if (!first && OB_FAIL(sql.append(", "))) {
+      } else if (OB_SUCC(ret) && OB_FAIL(ai_retry_print_expr(node->children_[i], column_name, sql))) {
+      } else {
+        first = false;
+      }
+    }
+  } else if (OB_FAIL(ai_retry_print_expr(node, column_name, sql))) {
+  }
+  return ret;
+}
+
+static int ai_retry_print_expr(const ParseNode *node, const ObString &column_name, ObSqlString &sql)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(node)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    switch (node->type_) {
+      case T_OP_AND:
+      case T_OP_OR:
+      case T_OP_EQ:
+      case T_OP_NE:
+      case T_OP_LE:
+      case T_OP_LT:
+      case T_OP_GE:
+      case T_OP_GT: {
+        const char *op = NULL;
+        switch (node->type_) {
+          case T_OP_AND: op = " and "; break;
+          case T_OP_OR: op = " or "; break;
+          case T_OP_EQ: op = " = "; break;
+          case T_OP_NE: op = " != "; break;
+          case T_OP_LE: op = " <= "; break;
+          case T_OP_LT: op = " < "; break;
+          case T_OP_GE: op = " >= "; break;
+          default: op = " > "; break;
+        }
+        if (2 != node->num_child_ || OB_ISNULL(node->children_)) {
+          ret = OB_ERR_UNEXPECTED;
+        } else if (OB_FAIL(sql.append("("))) {
+        } else if (OB_FAIL(ai_retry_print_expr(node->children_[0], column_name, sql))) {
+        } else if (OB_FAIL(sql.append(op))) {
+        } else if (OB_FAIL(ai_retry_print_expr(node->children_[1], column_name, sql))) {
+        } else if (OB_FAIL(sql.append(")"))) {
+        }
+        break;
+      }
+      case T_OP_IN: {
+        if (2 != node->num_child_ || OB_ISNULL(node->children_)) {
+          ret = OB_ERR_UNEXPECTED;
+        } else if (OB_FAIL(ai_retry_print_expr(node->children_[0], column_name, sql))) {
+        } else if (OB_FAIL(sql.append(" in ("))) {
+        } else if (OB_FAIL(ai_retry_print_expr_list(node->children_[1], column_name, sql))) {
+        } else if (OB_FAIL(sql.append(")"))) {
+        }
+        break;
+      }
+      case T_VARCHAR: {
+        ObString value(node->str_len_, node->str_value_);
+        ret = ai_retry_print_quoted_string(sql, value);
+        break;
+      }
+      case T_INT: {
+        ret = sql.append_fmt("%ld", node->value_);
+        break;
+      }
+      case T_NUMBER: {
+        ObString value(node->str_len_, node->str_value_);
+        ret = sql.append(value);
+        break;
+      }
+      case T_NULL: {
+        ret = sql.append("null");
+        break;
+      }
+      case T_IDENT:
+      case T_COLUMN_REF: {
+        const ParseNode *name_node = NULL;
+        if (T_COLUMN_REF == node->type_ && node->num_child_ >= 3 && OB_NOT_NULL(node->children_)) {
+          name_node = node->children_[2];
+        } else {
+          name_node = node;
+        }
+        if (OB_ISNULL(name_node) || OB_ISNULL(name_node->str_value_) || name_node->str_len_ <= 0) {
+          ret = OB_ERR_UNEXPECTED;
+        } else {
+          ObString name(name_node->str_len_, name_node->str_value_);
+          const bool quoted = (0 != name_node->is_input_quoted_ || 0 != node->is_input_quoted_);
+          if (!quoted && 0 == name.case_compare("status")) {
+            // STATUS pseudo column: READY when the AI result is present, otherwise FAILED
+            if (OB_FAIL(sql.append("if("))) {
+            } else if (OB_FAIL(ai_retry_print_ident(sql, column_name))) {
+            } else if (OB_FAIL(sql.append(" is null, 'FAILED', 'READY')"))) {
+            }
+          } else if (OB_FAIL(ai_retry_print_ident(sql, name))) {
+          }
+        }
+        break;
+      }
+      default: {
+        LOG_WARN("unsupported ai retry predicate node type", "node_type", node->type_,
+                 "num_child", node->num_child_);
+        ret = OB_NOT_SUPPORTED;
+        break;
+      }
+    }
+  }
+  return ret;
+}
+
+static int ai_retry_find_column_id(const uint64_t table_id,
+                                   const ObString &column_name,
+                                   uint64_t &column_id,
+                                   bool &found)
+{
+  int ret = OB_SUCCESS;
+  found = false;
+  ObSqlString sql;
+  if (OB_FAIL(sql.append_fmt("select column_id from oceanbase.__all_ai_column where table_id = %lu and column_name = ", table_id))) {
+  } else if (OB_FAIL(sql_append_hex_escape_str(column_name, sql))) {
+  } else {
+    SMART_VAR(ObMySQLProxy::MySQLResult, result) {
+      if (OB_ISNULL(GCTX.sql_proxy_)) {
+        ret = OB_NOT_INIT;
+      } else if (OB_FAIL(GCTX.sql_proxy_->read(result, sql.ptr()))) {
+      } else if (OB_ISNULL(result.get_result())) {
+        ret = OB_ERR_UNEXPECTED;
+      } else {
+        sqlclient::ObMySQLResult *mysql_result = result.get_result();
+        int next_ret = mysql_result->next();
+        if (OB_ITER_END == next_ret) {
+          // not an AI column
+        } else if (OB_FAIL(next_ret)) {
+          ret = next_ret;
+        } else {
+          int64_t column_id_int = 0;
+          if (OB_FAIL(mysql_result->get_int(static_cast<int64_t>(0), column_id_int))) {
+          } else {
+            column_id = static_cast<uint64_t>(column_id_int);
+            found = true;
+          }
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+}  // namespace
+
+int ObAlterTableResolver::resolve_ai_column_retry(const ParseNode &node)
+{
+  int ret = OB_SUCCESS;
+  ObAlterTableStmt *alter_table_stmt = get_alter_table_stmt();
+  if (OB_ISNULL(alter_table_stmt) || OB_ISNULL(table_schema_) || OB_ISNULL(allocator_)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (2 != node.num_child_ || OB_ISNULL(node.children_) || OB_ISNULL(node.children_[0])) {
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    ParseNode *column_node = node.children_[0];
+    ParseNode *where_node = node.children_[1];
+    ObString column_name(column_node->str_len_, column_node->str_value_);
+    uint64_t column_id = OB_INVALID_ID;
+    bool found = false;
+    if (column_name.empty()) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_FAIL(ai_retry_find_column_id(table_schema_->get_table_id(), column_name, column_id, found))) {
+    } else if (!found) {
+      ret = OB_NOT_SUPPORTED;
+      SQL_RESV_LOG(WARN, "retrying a column that is not an ai column", K(ret), K(column_name));
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "retrying a column that is not an AI column");
+    } else {
+      ObSqlString where_sql;
+      if (OB_NOT_NULL(where_node)) {
+        if (T_WHERE_CLAUSE != where_node->type_ || where_node->num_child_ < 1
+            || OB_ISNULL(where_node->children_) || OB_ISNULL(where_node->children_[0])) {
+          ret = OB_ERR_UNEXPECTED;
+        } else if (OB_FAIL(ai_retry_print_expr(where_node->children_[0], column_name, where_sql))) {
+          SQL_RESV_LOG(WARN, "failed to print ai column retry predicate", K(ret));
+        }
+      }
+      if (OB_SUCC(ret) && OB_FAIL(alter_table_stmt->set_ai_column_retry(*allocator_,
+                                                                       database_name_,
+                                                                       table_name_,
+                                                                       column_name,
+                                                                       column_id,
+                                                                       where_sql.string()))) {
+      }
+    }
+  }
+  return ret;
+}
+
 int ObAlterTableResolver::resolve_action_list(const ParseNode &node)
 {
   int ret = OB_SUCCESS;
@@ -401,6 +635,15 @@ int ObAlterTableResolver::resolve_action_list(const ParseNode &node)
       } else if (FALSE_IT(alter_table_stmt->inc_alter_table_action_count())) {
       } else {
         switch (action_node->type_) {
+        case T_AI_COLUMN: {
+            // ALTER TABLE ... RETRY AI COLUMN col [WHERE ...]
+            if (node.num_child_ > 1) {
+              ret = OB_NOT_SUPPORTED;
+              LOG_USER_ERROR(OB_NOT_SUPPORTED, "combining AI COLUMN RETRY with another ALTER action");
+            } else if (OB_FAIL(resolve_ai_column_retry(*action_node))) {
+            }
+            break;
+          }
         //deal with alter table option
         case T_ALTER_TABLE_OPTION: {
             alter_table_stmt->set_alter_table_option();
