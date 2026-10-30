@@ -18,6 +18,10 @@
 #include "config_bridge.h"
 #include "common/ob_timeout_ctx.h"
 #include "lib/stat/ob_diagnostic_info_guard.h"
+#include "share/schema/ob_multi_version_schema_service.h"
+#include "share/schema/ob_schema_getter_guard.h"
+#include "lib/string/ob_sql_string.h"
+#include "lib/utility/utility.h"
 #include "share/ob_server_struct.h"
 #include "sql/engine/cmd/ob_table_executor.h"
 #include "query/command/ob_root_command_service.h"
@@ -440,6 +444,240 @@ int ObCreateTableExecutor::execute_ctas(ObExecContext &ctx,
   return ret;
 }
 
+struct ObAiColumnMetaRow
+{
+  ObAiColumnMetaRow()
+    : column_id_(0), max_retries_(0), has_max_retries_(false),
+      state_column_id_(0), request_column_id_(0), result_spec_column_id_(0),
+      column_name_(), function_name_(), model_name_(), normalized_expr_(),
+      deps_(), sync_mode_()
+  {}
+  uint64_t column_id_;
+  int64_t max_retries_;
+  bool has_max_retries_;
+  uint64_t state_column_id_;
+  uint64_t request_column_id_;
+  uint64_t result_spec_column_id_;
+  ObString column_name_;
+  ObString function_name_;
+  ObString model_name_;
+  ObString normalized_expr_;
+  ObString deps_;
+  ObString sync_mode_;
+};
+
+static int split_ai_column_comment(ObString fields[12], int64_t &field_count, const ObString &comment)
+{
+  int ret = OB_SUCCESS;
+  field_count = 0;
+  int64_t start = 0;
+  for (int64_t i = 0; OB_SUCC(ret) && i <= static_cast<int64_t>(comment.length()); ++i) {
+    if (i == static_cast<int64_t>(comment.length()) || '|' == comment.ptr()[i]) {
+      if (field_count >= 12) {
+        ret = OB_SIZE_OVERFLOW;
+      } else {
+        fields[field_count++].assign_ptr(comment.ptr() + start, static_cast<int32_t>(i - start));
+        start = i + 1;
+      }
+    }
+  }
+  return ret;
+}
+
+static int ai_column_hex_decode(ObIAllocator &allocator, const ObString &hex, ObString &out)
+{
+  int ret = OB_SUCCESS;
+  if (hex.length() % 2 != 0) {
+    ret = OB_INVALID_ARGUMENT;
+  } else {
+    const int64_t n = hex.length() / 2;
+    char *buf = static_cast<char *>(allocator.alloc(n > 0 ? n : 1));
+    if (OB_ISNULL(buf)) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else {
+      for (int64_t i = 0; OB_SUCC(ret) && i < n; ++i) {
+        int hi = 0;
+        int lo = 0;
+        const char a = hex.ptr()[2 * i];
+        const char b = hex.ptr()[2 * i + 1];
+        if (a >= '0' && a <= '9') { hi = a - '0'; }
+        else if (a >= 'A' && a <= 'F') { hi = a - 'A' + 10; }
+        else if (a >= 'a' && a <= 'f') { hi = a - 'a' + 10; }
+        else { ret = OB_INVALID_ARGUMENT; }
+        if (OB_SUCC(ret)) {
+          if (b >= '0' && b <= '9') { lo = b - '0'; }
+          else if (b >= 'A' && b <= 'F') { lo = b - 'A' + 10; }
+          else if (b >= 'a' && b <= 'f') { lo = b - 'a' + 10; }
+          else { ret = OB_INVALID_ARGUMENT; }
+        }
+        if (OB_SUCC(ret)) {
+          buf[i] = static_cast<char>((hi << 4) | lo);
+        }
+      }
+      if (OB_SUCC(ret)) {
+        out.assign_ptr(buf, static_cast<int32_t>(n));
+      }
+    }
+  }
+  return ret;
+}
+
+static int parse_ai_column_int(const ObString &str, int64_t &value)
+{
+  int ret = OB_SUCCESS;
+  value = 0;
+  if (str.empty()) {
+    ret = OB_INVALID_ARGUMENT;
+  } else {
+    for (int64_t i = 0; OB_SUCC(ret) && i < str.length(); ++i) {
+      if (str.ptr()[i] < '0' || str.ptr()[i] > '9') {
+        ret = OB_INVALID_ARGUMENT;
+      } else {
+        value = value * 10 + (str.ptr()[i] - '0');
+      }
+    }
+  }
+  return ret;
+}
+
+static int write_ai_column_metadata(ObExecContext &ctx, const uint64_t table_id,
+                                    const ObString &database_name = ObString(),
+                                    const ObString &table_name = ObString())
+{
+  int ret = OB_SUCCESS;
+  ObSchemaGetterGuard guard;
+  const ObTableSchema *table_schema = NULL;
+  ObArenaAllocator allocator;
+  ObSEArray<ObAiColumnMetaRow, 4> metas;
+  const bool use_id = (OB_INVALID_ID != table_id && 0 != table_id);
+  UNUSED(ctx);
+  if (OB_ISNULL(GCTX.schema_service_) || OB_ISNULL(GCTX.sql_proxy_)) {
+    ret = OB_NOT_INIT;
+  }
+  for (int64_t attempt = 0; OB_SUCC(ret) && OB_ISNULL(table_schema) && attempt < 30; ++attempt) {
+    guard.reset();
+    if (OB_FAIL(GCTX.schema_service_->get_runtime_schema_guard(guard))) {
+    } else if (use_id) {
+      if (OB_FAIL(guard.get_table_schema(table_id, table_schema))) {
+        table_schema = NULL;
+        ret = OB_SUCCESS;
+        usleep(100 * 1000);
+      }
+    } else if (OB_FAIL(guard.get_table_schema(database_name, table_name, false, table_schema))) {
+      table_schema = NULL;
+      ret = OB_SUCCESS;
+      usleep(100 * 1000);
+    }
+  }
+  if (OB_SUCC(ret) && OB_ISNULL(table_schema)) {
+    LOG_WARN("failed to fetch table schema for ai column metadata", K(table_id));
+  }
+  const uint64_t effective_table_id = (use_id || OB_ISNULL(table_schema)) ? table_id : table_schema->get_table_id();
+  if (OB_SUCC(ret) && OB_NOT_NULL(table_schema)) {
+    ObTableSchema::const_column_iterator iter = table_schema->column_begin();
+    for (; OB_SUCC(ret) && OB_NOT_NULL(iter) && iter != table_schema->column_end(); ++iter) {
+      const ObColumnSchemaV2 *col = *iter;
+      ObString fields[12];
+      int64_t field_count = 0;
+      if (OB_ISNULL(col) || !col->is_hidden()) {
+      } else if (!col->get_comment_str().prefix_match("AICOL|")) {
+      } else if (OB_FAIL(split_ai_column_comment(fields, field_count, col->get_comment_str()))) {
+      } else if (field_count < 8
+                 || (0 != fields[2].case_compare("state")
+                     && 0 != fields[2].case_compare("request")
+                     && 0 != fields[2].case_compare("result_spec"))) {
+      } else {
+        ObAiColumnMetaRow *meta = NULL;
+        for (int64_t i = 0; NULL == meta && OB_SUCC(ret) && i < metas.count(); ++i) {
+          if (0 == metas.at(i).column_name_.case_compare(fields[3])) {
+            meta = &metas.at(i);
+          }
+        }
+        if (OB_SUCC(ret) && NULL == meta) {
+          ObAiColumnMetaRow new_meta;
+          if (OB_FAIL(ob_write_string(allocator, fields[3], new_meta.column_name_))) {
+          } else if (OB_FAIL(metas.push_back(new_meta))) {
+          } else {
+            meta = &metas.at(metas.count() - 1);
+          }
+        }
+        if (OB_SUCC(ret) && OB_NOT_NULL(meta)) {
+          if (0 == fields[2].case_compare("state")) {
+            meta->state_column_id_ = col->get_column_id();
+            if (OB_FAIL(parse_ai_column_int(fields[4], meta->max_retries_))) {
+            } else if (OB_FAIL(ob_write_string(allocator, fields[6], meta->function_name_))) {
+            } else if (OB_FAIL(ob_write_string(allocator, fields[7], meta->model_name_))) {
+            } else if (OB_FAIL(ai_column_hex_decode(allocator, fields[8], meta->normalized_expr_))) {
+            } else if (OB_FAIL(ai_column_hex_decode(allocator, fields[9], meta->deps_))) {
+            } else if (field_count > 10 && OB_FAIL(ob_write_string(allocator, fields[10], meta->sync_mode_))) {
+            }
+            meta->has_max_retries_ = true;
+          } else if (0 == fields[2].case_compare("request")) {
+            meta->request_column_id_ = col->get_column_id();
+          } else {
+            meta->result_spec_column_id_ = col->get_column_id();
+          }
+        }
+      }
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && i < metas.count(); ++i) {
+      ObAiColumnMetaRow &meta = metas.at(i);
+      const ObColumnSchemaV2 *result_col = table_schema->get_column_schema(meta.column_name_);
+      if (OB_ISNULL(result_col)) {
+        LOG_WARN("ai column result column not found", K(meta.column_name_));
+        ret = OB_ERR_UNEXPECTED;
+      } else {
+        meta.column_id_ = result_col->get_column_id();
+      }
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && i < metas.count(); ++i) {
+      ObAiColumnMetaRow &meta = metas.at(i);
+      ObSqlString sql;
+      int64_t affected_rows = 0;
+      const uint64_t column_id = meta.column_id_;
+      const uint64_t db_id = table_schema->get_database_id();
+      const ObString &table_name = table_schema->get_table_name_str();
+      if (OB_FAIL(sql.assign_fmt("INSERT INTO __all_ai_column (table_id, column_id, column_name, "
+                                 "table_name, database_id, ai_model_name, function_name, "
+                                 "normalized_expr, dependencies, sync_mode, max_retries, "
+                                 "state_column_id, request_column_id, result_spec_column_id, version, "
+                                 "gmt_create, gmt_modified) VALUES (%lu, %lu, ",
+                                 effective_table_id, column_id))) {
+      } else if (OB_FAIL(sql_append_hex_escape_str(meta.column_name_, sql))) {
+      } else if (OB_FAIL(sql.append(", "))) {
+      } else if (OB_FAIL(sql_append_hex_escape_str(table_name, sql))) {
+      } else if (OB_FAIL(sql.append_fmt(", %lu, ", db_id))) {
+      } else if (OB_FAIL(sql_append_hex_escape_str(meta.model_name_, sql))) {
+      } else if (OB_FAIL(sql.append(", "))) {
+      } else if (OB_FAIL(sql_append_hex_escape_str(meta.function_name_, sql))) {
+      } else if (OB_FAIL(sql.append(", "))) {
+      } else if (OB_FAIL(sql_append_hex_escape_str(meta.normalized_expr_, sql))) {
+      } else if (OB_FAIL(sql.append(", "))) {
+      } else if (OB_FAIL(sql_append_hex_escape_str(meta.deps_, sql))) {
+      } else if (OB_FAIL(sql.append(", "))) {
+      } else if (OB_FAIL(sql_append_hex_escape_str(meta.sync_mode_, sql))) {
+      } else if (OB_FAIL(sql.append_fmt(", %ld, %lu, %lu, %lu, 1, now(6), now(6)) "
+                                         "ON DUPLICATE KEY UPDATE column_name = VALUES(column_name), "
+                                         "table_name = VALUES(table_name), database_id = VALUES(database_id), "
+                                         "ai_model_name = VALUES(ai_model_name), function_name = VALUES(function_name), "
+                                         "normalized_expr = VALUES(normalized_expr), dependencies = VALUES(dependencies), "
+                                         "sync_mode = VALUES(sync_mode), max_retries = VALUES(max_retries), "
+                                         "state_column_id = VALUES(state_column_id), "
+                                         "request_column_id = VALUES(request_column_id), "
+                                         "result_spec_column_id = VALUES(result_spec_column_id), "
+                                         "version = VALUES(version), gmt_modified = now(6)",
+                                         meta.max_retries_, meta.state_column_id_,
+                                         meta.request_column_id_, meta.result_spec_column_id_))) {
+      } else if (OB_FAIL(GCTX.sql_proxy_->write(sql.ptr(), affected_rows))) {
+        LOG_WARN("failed to write ai column metadata", K(ret), K(sql));
+      } else {
+        LOG_INFO("ai column metadata written", K(effective_table_id), K(column_id), K(affected_rows));
+      }
+    }
+  }
+  return ret;
+}
+
 int ObCreateTableExecutor::execute(ObExecContext &ctx, ObCreateTableStmt &stmt)
 {
   int ret = OB_SUCCESS;
@@ -490,6 +728,12 @@ int ObCreateTableExecutor::execute(ObExecContext &ctx, ObCreateTableStmt &stmt)
       }
     } else {
       if (OB_FAIL(execute_ctas(ctx, stmt))){
+      }
+    }
+    if (OB_SUCC(ret)) {
+      int tmp_ret = write_ai_column_metadata(ctx, res.table_id_);
+      if (OB_SUCCESS != tmp_ret) {
+        LOG_WARN("failed to write ai column metadata for create table", K(tmp_ret), K(res.table_id_));
       }
     }
     SERVER_EVENT_ADD("ddl", "create table execute finish",
@@ -871,6 +1115,14 @@ int ObAlterTableExecutor::execute(ObExecContext &ctx, ObAlterTableStmt &stmt)
     snprintf(table_info_buffer, sizeof(table_info_buffer), "table_id:%ld, hidden_table_id:%ld", 
               alter_table_arg.table_id_, alter_table_arg.hidden_table_id_);
 
+    if (OB_SUCC(ret)) {
+      int tmp_ret = write_ai_column_metadata(ctx, alter_table_arg.table_id_,
+                                              alter_table_arg.alter_table_schema_.get_origin_database_name(),
+                                              alter_table_arg.alter_table_schema_.get_origin_table_name());
+      if (OB_SUCCESS != tmp_ret) {
+        LOG_WARN("failed to write ai column metadata for alter table", K(tmp_ret), K(alter_table_arg.table_id_));
+      }
+    }
     SERVER_EVENT_ADD("ddl", "alter table execute finish",
       "ret", ret,
       "trace_id", *ObCurTraceId::get_trace_id(),

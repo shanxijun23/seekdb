@@ -3414,6 +3414,7 @@ int ObAlterTableResolver::resolve_add_column(const ParseNode &node, ObColumnName
         //resolve column definition
         stat.reset();
         bool is_modify_column_visibility = false;
+        const int64_t ai_attr_before = ai_column_attrs_.count();
         ObSEArray<ObColumnSchemaV2 *, 8> resolved_cols;
         if (OB_FAIL(get_table_schema_all_column_schema(resolved_cols, alter_table_stmt->get_alter_table_schema()))) {
         } else if (OB_FAIL(resolve_alter_table_column_definition(alter_column_schema,
@@ -3457,6 +3458,19 @@ int ObAlterTableResolver::resolve_add_column(const ParseNode &node, ObColumnName
         if (OB_SUCC(ret)) {
           if (OB_FAIL(alter_table_stmt->add_column(alter_column_schema))) {
           } else if (FALSE_IT(alter_table_stmt->set_sql_mode(session_info_->get_sql_mode()))) {
+          }
+        }
+        // AI COLUMN: append the hidden state/request/result_spec columns
+        if (OB_SUCC(ret)) {
+          for (int64_t ai_idx = ai_attr_before; OB_SUCC(ret) && ai_idx < ai_column_attrs_.count(); ++ai_idx) {
+            for (int64_t role = 0; OB_SUCC(ret) && role < 3; ++role) {
+              share::schema::AlterColumnSchema hidden_col;
+              hidden_col.alter_type_ = OB_DDL_ADD_COLUMN;
+              if (OB_FAIL(build_ai_hidden_column(ai_column_attrs_.at(ai_idx), role,
+                                                 static_cast<share::schema::ObColumnSchemaV2 &>(hidden_col)))) {
+              } else if (OB_FAIL(alter_table_stmt->add_column(hidden_col))) {
+              }
+            }
           }
         }
       }

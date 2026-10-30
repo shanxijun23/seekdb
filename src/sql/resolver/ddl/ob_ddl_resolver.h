@@ -106,6 +106,35 @@ struct ObDefaultValueRes
   common::ObObjParam &value_;
 };
 
+struct ObAIColumnAttribute
+{
+  ObAIColumnAttribute()
+    : column_name_(), normalized_expr_(), model_name_(), function_name_(), deps_(),
+      sync_mode_(), max_retries_(0), has_max_retries_(false), embed_dim_(-1)
+  {}
+  void reset()
+  {
+    column_name_.reset();
+    normalized_expr_.reset();
+    model_name_.reset();
+    function_name_.reset();
+    deps_.reset();
+    sync_mode_.reset();
+    max_retries_ = 0;
+    has_max_retries_ = false;
+    embed_dim_ = -1;
+  }
+  common::ObString column_name_;
+  common::ObString normalized_expr_;
+  common::ObString model_name_;
+  common::ObString function_name_;
+  common::ObString deps_;
+  common::ObString sync_mode_;
+  int64_t max_retries_;
+  bool has_max_retries_;
+  int64_t embed_dim_;
+};
+
 class ObDDLResolver : public ObStmtResolver
 {
 public:
@@ -164,6 +193,14 @@ public:
     OB_ORGANIZATION_MAX
   };
   static const int NAMENODE = 1;
+
+  int resolve_ai_column_attribute(share::schema::ObColumnSchemaV2 &column,
+                                  ParseNode *attr_node,
+                                  ObColumnResolveStat &resolve_stat,
+                                  const share::schema::ObTableSchema &table_schema);
+  int build_ai_hidden_column(const ObAIColumnAttribute &attr,
+                             const int64_t role,
+                             share::schema::ObColumnSchemaV2 &hidden_column);
 
   static const int64_t MAX_PROGRESSIVE_MERGE_NUM = 100;
   static const int64_t MIN_BLOCK_SIZE = 1024;
@@ -881,6 +918,7 @@ protected:
   common::ObString vec_column_name_;
   ObIndexType vec_index_type_;
   ObSemiStructEncodingType semistruct_encoding_type_;
+  ObSEArray<ObAIColumnAttribute, 4> ai_column_attrs_;
 private:
   template <typename STMT>
   DISALLOW_COPY_AND_ASSIGN(ObDDLResolver);

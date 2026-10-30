@@ -2447,6 +2447,60 @@ all_ai_model_endpoint_def = dict(
 )
 def_table_schema(**all_ai_model_endpoint_def)
 
+all_ai_column_def = dict(
+    owner = 'ai-column',
+    table_name = '__all_ai_column',
+    table_id = '1131',
+    table_type = 'SYSTEM_TABLE',
+    gm_columns = ['gmt_create', 'gmt_modified'],
+    rowkey_columns = [
+        ('table_id', 'int'),
+        ('column_id', 'int')
+    ],
+    is_cluster_private = False,
+    meta_record_in_sys = False,
+    normal_columns = [
+        ('column_name', 'varchar:OB_MAX_COLUMN_NAME_LENGTH', 'false'),
+        ('table_name', 'varchar:OB_MAX_TABLE_NAME_LENGTH', 'true'),
+        ('database_id', 'int', 'true'),
+        ('ai_model_name', 'varchar:128', 'true'),
+        ('function_name', 'varchar:64', 'true'),
+        ('normalized_expr', 'varchar:4096', 'true'),
+        ('dependencies', 'varchar:4096', 'true'),
+        ('sync_mode', 'varchar:64', 'true'),
+        ('max_retries', 'int', 'false', 0),
+        ('state_column_id', 'int', 'false', 0),
+        ('request_column_id', 'int', 'false', 0),
+        ('result_spec_column_id', 'int', 'false', 0),
+        ('version', 'int', 'false', 1)
+    ]
+)
+def_table_schema(**all_ai_column_def)
+
+all_ai_column_task_def = dict(
+    owner = 'ai-column',
+    table_name = '__all_ai_column_task',
+    table_id = '1132',
+    table_type = 'SYSTEM_TABLE',
+    gm_columns = ['gmt_create', 'gmt_modified'],
+    rowkey_columns = [
+        ('request_id', 'int'),
+        ('column_id', 'int')
+    ],
+    is_cluster_private = False,
+    meta_record_in_sys = False,
+    normal_columns = [
+        ('table_id', 'int', 'false'),
+        ('rowkey_predicate', 'varchar:1024', 'true'),
+        ('state', 'int', 'false', 0),
+        ('eligible_ts', 'timestamp', 'true'),
+        ('retry_count', 'int', 'false', 0),
+        ('last_error', 'varchar:1024', 'true'),
+        ('create_ts', 'timestamp', 'true')
+    ]
+)
+def_table_schema(**all_ai_column_task_def)
+
 
 all_objauth_mysql_def = dict(
     owner = 'cjl476581',
