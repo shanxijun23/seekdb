@@ -202,7 +202,12 @@ int ObAiModelEndpointInfo::merge_delta_endpoint(common::ObArenaAllocator &alloca
   if (OB_SUCC(ret)) {
     if (has_api_key && !access_key_.empty() && OB_FAIL(encrypt_access_key_(allocator, access_key_, access_key_))) {
       LOG_WARN("failed to encrypt access key", K(ret));
-    } else if (OB_FAIL(check_valid())) {
+    } else if (access_key_.empty()) {
+      // an omitted/empty access_key must stay an empty string (not NULL) in the
+      // inner table, otherwise the next select/decrypt reports OB_ERR_NULL_VALUE.
+      access_key_ = ObString(0, "");
+    }
+    if (OB_SUCC(ret) && OB_FAIL(check_valid())) {
     }
   }
 
@@ -221,7 +226,11 @@ int ObAiModelEndpointInfo::encrypt_access_key_(ObIAllocator &allocator, const Ob
 int ObAiModelEndpointInfo::decrypt_access_key_(ObIAllocator &allocator, const ObString &encrypted_access_key, ObString &unencrypted_access_key) const
 {
   int ret = OB_SUCCESS;
-  if (OB_FAIL(ob_write_string(allocator, encrypted_access_key, unencrypted_access_key))) {
+  if (encrypted_access_key.empty()) {
+    // an empty access key (e.g. ollama local deployment, or a row updated by
+    // ALTER without touching access_key) is legal and means "no api key".
+    unencrypted_access_key = ObString(0, "");
+  } else if (OB_FAIL(ob_write_string(allocator, encrypted_access_key, unencrypted_access_key))) {
   }
   return ret;
 }
