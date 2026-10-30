@@ -2060,6 +2060,81 @@ static int ai_column_collect_column_refs(ParseNode *node, ObIAllocator &allocato
   return ret;
 }
 
+// Extract the prompt (2nd) argument text of an AI function call from its raw SQL text.
+static int extract_ai_column_prompt_expr(const ObString &expr_str, ObIAllocator &allocator, ObString &prompt_expr)
+{
+  int ret = OB_SUCCESS;
+  int64_t open_pos = -1;
+  int64_t depth = 0;
+  int64_t arg_start = -1;
+  int64_t arg_index = 0;
+  bool in_squote = false;
+  bool in_dquote = false;
+  bool in_btick = false;
+  if (expr_str.empty()) {
+    ret = OB_INVALID_ARGUMENT;
+  } else {
+    for (int64_t i = 0; OB_SUCC(ret) && i < expr_str.length(); ++i) {
+      const char ch = expr_str.ptr()[i];
+      if (in_squote) {
+        if ('\\' == ch) {
+          ++i;
+        } else if ('\'' == ch) {
+          in_squote = false;
+        }
+      } else if (in_dquote) {
+        if ('\\' == ch) {
+          ++i;
+        } else if ('"' == ch) {
+          in_dquote = false;
+        }
+      } else if (in_btick) {
+        if ('`' == ch) {
+          in_btick = false;
+        }
+      } else if ('\'' == ch) {
+        in_squote = true;
+      } else if ('"' == ch) {
+        in_dquote = true;
+      } else if ('`' == ch) {
+        in_btick = true;
+      } else if ('(' == ch) {
+        ++depth;
+        if (1 == depth) {
+          arg_start = i + 1;
+          arg_index = 0;
+        }
+      } else if (')' == ch) {
+        if (1 == depth) {
+          if (1 == arg_index) {
+            int64_t end = i;
+            while (end > arg_start && (' ' == expr_str.ptr()[end - 1] || '\t' == expr_str.ptr()[end - 1])) {
+              --end;
+            }
+            if (end > arg_start) {
+              if (OB_FAIL(ob_write_string(allocator, ObString(static_cast<int32_t>(end - arg_start),
+                                                              expr_str.ptr() + arg_start), prompt_expr))) {
+              }
+            }
+          }
+          depth = 0;
+        } else if (depth > 1) {
+          --depth;
+        }
+      } else if (',' == ch && 1 == depth) {
+        ++arg_index;
+        arg_start = i + 1;
+        // skip leading spaces of next argument
+        while (arg_start < expr_str.length()
+               && (' ' == expr_str.ptr()[arg_start] || '\t' == expr_str.ptr()[arg_start])) {
+          ++arg_start;
+        }
+      }
+    }
+  }
+  return ret;
+}
+
 int ObDDLResolver::resolve_ai_column_attribute(ObColumnSchemaV2 &column,
                                                ParseNode *attr_node,
                                                ObColumnResolveStat &resolve_stat,
@@ -2152,9 +2227,9 @@ int ObDDLResolver::resolve_ai_column_attribute(ObColumnSchemaV2 &column,
         }
       }
       // generate normalized expression with typed system prompt
+      ObString expr_str(expr_node->str_len_, expr_node->str_value_);
       if (OB_SUCC(ret)) {
         const char *json_prompt = column.is_json() ? " | Return exactly one valid JSON value" : "";
-        ObString expr_str(expr_node->str_len_, expr_node->str_value_);
         ObStringBuffer normalized(allocator_);
         if (OB_FAIL(normalized.append(expr_str))) {
         } else if (OB_FAIL(normalized.append(json_prompt))) {
@@ -2162,8 +2237,41 @@ int ObDDLResolver::resolve_ai_column_attribute(ObColumnSchemaV2 &column,
         } else {
           attr.max_retries_ = max_retries;
           attr.has_max_retries_ = has_max_retries;
-          if (OB_FAIL(deep_copy_str(sync_mode, attr.sync_mode_))) {
-          } else if (OB_FAIL(ai_column_attrs_.push_back(attr))) {
+          ObString prompt_expr;
+          if (OB_FAIL(extract_ai_column_prompt_expr(expr_str, *allocator_, prompt_expr))) {
+          } else if (OB_FAIL(deep_copy_str(prompt_expr, attr.prompt_expr_))) {
+          } else if (OB_FAIL(deep_copy_str(sync_mode, attr.sync_mode_))) {
+          } else if (column.is_json()) {
+            attr.result_type_ = 1;
+            const char *ai_col_json_prompt = "Return exactly one valid JSON value, do not output anything else.";
+            if (OB_FAIL(deep_copy_str(ObString(static_cast<int32_t>(strlen(ai_col_json_prompt)),
+                                               ai_col_json_prompt),
+                                      attr.system_prompt_))) {
+            }
+          } else if (column.is_collection()) {
+            attr.result_type_ = 2;
+            const ObIArray<ObString> &type_info2 = column.get_extended_type_info();
+            if (type_info2.count() == 1) {
+              ObArenaAllocator tmp_alloc2;
+              ObSqlCollectionInfo coll_info2(tmp_alloc2);
+              coll_info2.set_name(type_info2.at(0));
+              if (OB_SUCC(coll_info2.parse_type_info())) {
+                ObCollectionArrayType *arr2 = static_cast<ObCollectionArrayType *>(coll_info2.collection_meta_);
+                if (OB_NOT_NULL(arr2)) {
+                  attr.vector_dim_ = static_cast<int64_t>(arr2->dim_cnt_);
+                }
+              }
+            }
+          } else if (column.is_string_type()) {
+            attr.result_type_ = 3;
+          } else {
+            attr.result_type_ = 4;
+            const char *integer_prompt = "Return exactly one base-10 integer, do not output anything else.";
+            if (OB_FAIL(deep_copy_str(ObString(static_cast<int32_t>(strlen(integer_prompt)), integer_prompt),
+                                      attr.system_prompt_))) {
+            }
+          }
+          if (OB_SUCC(ret) && OB_FAIL(ai_column_attrs_.push_back(attr))) {
           }
         }
       }
@@ -2208,11 +2316,36 @@ int ObDDLResolver::build_ai_hidden_column(const ObAIColumnAttribute &attr,
         if (OB_FAIL(ai_column_hex_encode(attr.deps_.ptr(), attr.deps_.length(), comment_buf, sizeof(comment_buf), comment_pos))) {
         }
       }
-      if (OB_SUCC(ret) && attr.sync_mode_.length() > 0) {
-        if (comment_pos + 1 + attr.sync_mode_.length() < static_cast<int64_t>(sizeof(comment_buf))) {
+      if (OB_SUCC(ret)) {
+        if (comment_pos + 1 >= static_cast<int64_t>(sizeof(comment_buf))) {
+          ret = OB_SIZE_OVERFLOW;
+        } else {
           comment_buf[comment_pos++] = '|';
-          MEMCPY(comment_buf + comment_pos, attr.sync_mode_.ptr(), attr.sync_mode_.length());
-          comment_pos += attr.sync_mode_.length();
+          if (attr.sync_mode_.length() > 0) {
+            if (comment_pos + attr.sync_mode_.length() >= static_cast<int64_t>(sizeof(comment_buf))) {
+              ret = OB_SIZE_OVERFLOW;
+            } else {
+              MEMCPY(comment_buf + comment_pos, attr.sync_mode_.ptr(), attr.sync_mode_.length());
+              comment_pos += attr.sync_mode_.length();
+            }
+          }
+        }
+      }
+      // extra fields for the worker: prompt expression / system prompt / result type / vector dim
+      if (OB_SUCC(ret)) {
+        comment_pos += snprintf(comment_buf + comment_pos, sizeof(comment_buf) - comment_pos,
+                                "|%lld|%lld|", attr.result_type_, attr.vector_dim_);
+        if (comment_pos + 3 >= static_cast<int64_t>(sizeof(comment_buf))) {
+          ret = OB_SIZE_OVERFLOW;
+        } else if (OB_FAIL(ai_column_hex_encode(attr.prompt_expr_.ptr(), attr.prompt_expr_.length(),
+                                                comment_buf, sizeof(comment_buf), comment_pos))) {
+        } else if (comment_pos + 1 >= static_cast<int64_t>(sizeof(comment_buf))) {
+          ret = OB_SIZE_OVERFLOW;
+        } else {
+          comment_buf[comment_pos++] = '|';
+          if (OB_FAIL(ai_column_hex_encode(attr.system_prompt_.ptr(), attr.system_prompt_.length(),
+                                           comment_buf, sizeof(comment_buf), comment_pos))) {
+          }
         }
       }
     }

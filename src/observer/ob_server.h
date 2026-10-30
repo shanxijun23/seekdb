@@ -217,6 +217,51 @@ namespace standby { class StandbyModule; }
 namespace observer
 {
 
+class ObAIColumnWorkerTask : private common::ObTimerTask
+{
+public:
+  struct AiWorkerTask
+  {
+    AiWorkerTask()
+      : request_id_(0), column_id_(0), table_id_(0), retry_count_(0), max_retries_(0),
+        result_type_(-1), vector_dim_(0), metadata_ok_(false),
+        predicate_(), prompt_(), db_(), table_(), result_col_(), model_(), func_(),
+        system_prompt_(), prompt_expr_()
+    {}
+    int64_t request_id_;
+    int64_t column_id_;
+    int64_t table_id_;
+    int64_t retry_count_;
+    int64_t max_retries_;
+    int64_t result_type_;
+    int64_t vector_dim_;
+    bool metadata_ok_;
+    common::ObString predicate_;
+    common::ObString prompt_;
+    common::ObString db_;
+    common::ObString table_;
+    common::ObString result_col_;
+    common::ObString model_;
+    common::ObString func_;
+    common::ObString system_prompt_;
+    common::ObString prompt_expr_;
+  };
+public:
+  ObAIColumnWorkerTask();
+  virtual ~ObAIColumnWorkerTask() {}
+  int schedule(common::ObTimer &timer);
+  virtual void runTimerTask() override;
+private:
+  int do_work();
+  int load_tasks(common::ObIArray<AiWorkerTask> &tasks, int64_t &task_count);
+  int process_group(common::ObIArray<AiWorkerTask> &tasks, const int64_t start, const int64_t end);
+  int mark_task_failure(const AiWorkerTask &task, const int err_code, const char *reason);
+  static constexpr int64_t SCHEDULE_PERIOD = 100L * 1000L;
+  bool inited_;
+  bool is_running_;
+  common::ObArenaAllocator allocator_;
+};
+
 class ObServerOptions;
 class ObSchemaRefreshSchedulerAdapter;
 
@@ -485,6 +530,7 @@ private:
   common::ObTimer ctas_clean_up_timer_;
   ObServerDutyTask duty_task_;
   ObSqlMemoryTimerTask sql_mem_task_;
+  ObAIColumnWorkerTask ai_column_worker_task_;
   ObCTASCleanUpTask ctas_clean_up_task_;     // repeat & no retry
   ObRedefTableHeartBeatTask redef_table_heart_beat_task_;
   ObRefreshCpuFreqTimeTask refresh_cpu_frequency_task_;

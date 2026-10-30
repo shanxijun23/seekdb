@@ -75,10 +75,17 @@ int ObOpenAIUtils::ObOpenAIComplete::get_body(common::ObIAllocator &allocator,
     ObJsonObject *body_obj = nullptr;
     ObJsonString *model_str = nullptr;
     ObJsonArray *messages_array = nullptr;
+    ObString system_prompt = prompt;
+    if (OB_NOT_NULL(config)) {
+      ObIJsonBase *sp_node = config->get_value("system_prompt");
+      if (OB_NOT_NULL(sp_node) && ObJsonNodeType::J_STRING == sp_node->json_type()) {
+        system_prompt = static_cast<ObJsonString *>(sp_node)->get_str();
+      }
+    }
     if (OB_FAIL(ObAIFuncJsonUtils::get_json_object(allocator, body_obj))) {
     } else if (OB_FAIL(ObAIFuncJsonUtils::get_json_string(allocator, model, model_str))) {
     } else if (OB_FAIL(body_obj->add("model", model_str))) {
-    } else if (OB_FAIL(construct_messages_array(allocator, prompt, content, messages_array))) {
+    } else if (OB_FAIL(construct_messages_array(allocator, system_prompt, content, messages_array))) {
     } else if (OB_FAIL(body_obj->add("messages", messages_array))) {
     } else if (OB_FAIL(ObAIFuncJsonUtils::compact_json_object(allocator, config, body_obj))) {
     } else {

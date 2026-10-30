@@ -110,7 +110,8 @@ struct ObAIColumnAttribute
 {
   ObAIColumnAttribute()
     : column_name_(), normalized_expr_(), model_name_(), function_name_(), deps_(),
-      sync_mode_(), max_retries_(0), has_max_retries_(false), embed_dim_(-1)
+      sync_mode_(), prompt_expr_(), system_prompt_(), max_retries_(0),
+      has_max_retries_(false), embed_dim_(-1), result_type_(0), vector_dim_(0)
   {}
   void reset()
   {
@@ -120,6 +121,10 @@ struct ObAIColumnAttribute
     function_name_.reset();
     deps_.reset();
     sync_mode_.reset();
+    prompt_expr_.reset();
+    system_prompt_.reset();
+    result_type_ = 0;
+    vector_dim_ = 0;
     max_retries_ = 0;
     has_max_retries_ = false;
     embed_dim_ = -1;
@@ -130,9 +135,13 @@ struct ObAIColumnAttribute
   common::ObString function_name_;
   common::ObString deps_;
   common::ObString sync_mode_;
+  common::ObString prompt_expr_;
+  common::ObString system_prompt_;
   int64_t max_retries_;
   bool has_max_retries_;
   int64_t embed_dim_;
+  int64_t result_type_;
+  int64_t vector_dim_;
 };
 
 class ObDDLResolver : public ObStmtResolver
