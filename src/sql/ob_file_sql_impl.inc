@@ -136,8 +136,16 @@ static int file_sql_check_secure_path(ObSQLSessionInfo &session, const ObString 
       ret = file_sql_raise_file_error(path_cstr.ptr());
     } else {
       const int64_t priv_len = static_cast<int64_t>(strlen(priv_real));
-      if (0 != strncmp(path_real, priv_real, priv_len)
-          || (path_real[priv_len] != '\0' && path_real[priv_len] != '/')) {
+      bool matched = (0 == strncmp(path_real, priv_real, priv_len));
+      if (matched) {
+        // "/" as secure_file_priv allows every absolute path
+        if (priv_len > 0 && '/' == priv_real[priv_len - 1]) {
+          // prefix already ends at a path separator
+        } else if (path_real[priv_len] != '\0' && path_real[priv_len] != '/') {
+          matched = false;
+        }
+      }
+      if (!matched) {
         ret = file_sql_raise_no_privilege();
       }
     }
