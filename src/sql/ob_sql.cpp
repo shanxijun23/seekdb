@@ -38,6 +38,7 @@
 #include "sql/monitor/show_trace/ob_show_trace.h"
 #include "sql/optimizer/ob_optimizer.h"
 #include "share/rc/ob_server_runtime.h"
+#include "sql/ob_file_sql_impl.inc"
 
 namespace oceanbase
 {
@@ -184,11 +185,30 @@ int ObSql::stmt_query(const common::ObString &stmt, ObSqlCtx &context, ObResultS
            K(trunc_stmt));
 #endif
   NG_TRACE(parse_begin);
+  // file SQL (read_csv/read_json/read_parquet/glob) interception: rewrite the
+  // statement text after materializing the file table functions into temp tables
+  ObSqlString file_sql_rewritten;
+  bool file_sql_handled = false;
+  bool file_sql_failed = false;
+  ObString file_sql_stmt = stmt;
+  if (OB_FAIL(ret)) {
+  } else if (OB_FAIL(file_sql::file_sql_preprocess(stmt, result.get_session(), file_sql_rewritten,
+                                         file_sql_handled))) {
+    result.set_errcode(ret);
+    result.get_exec_context().set_need_disconnect(false);
+    file_sql_failed = true;
+  } else if (file_sql_handled) {
+    file_sql_stmt = file_sql_rewritten.string();
+  }
   //1 check inited
-  if (OB_FAIL(sanity_check(context))) {
-  } else if (OB_FAIL(handle_text_query(stmt, context, result))) {
+  if (file_sql_failed) {
+  } else if (OB_FAIL(sanity_check(context))) {
+  } else if (OB_FAIL(handle_text_query(file_sql_stmt, context, result))) {
     if (OB_EAGAIN != ret) {
     }
+  }
+  if (file_sql_handled) {
+    (void)file_sql::file_sql_finish_pending_copy(ret);
   }
   //LOG_DEBUG("result errno", N_ERR_CODE, result.get_errcode(), K(ret));
   if (OB_SUCCESS != ret
