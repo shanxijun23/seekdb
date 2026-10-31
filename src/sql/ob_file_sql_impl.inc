@@ -1557,18 +1557,19 @@ static int file_sql_preprocess(const ObString &stmt,
                        session, file_sql_path_to_check(fargs.path_, is_glob)))) {
           } else {
             FileSqlTableBuilder builder;
+            FileSchema func_schema;
             if (is_glob) {
-              if (OB_FAIL(file_sql_materialize_glob(fargs.path_, arena, builder, first_schema))) {
+              if (OB_FAIL(file_sql_materialize_glob(fargs.path_, arena, builder, func_schema))) {
               }
             } else if (is_csv) {
               if (OB_FAIL(file_sql_materialize_csv(fargs.path_, fargs.csv_, arena, builder,
-                                                  first_schema))) {
+                                                  func_schema))) {
               }
             } else if (is_json) {
-              if (OB_FAIL(file_sql_materialize_json(fargs.path_, arena, builder, first_schema))) {
+              if (OB_FAIL(file_sql_materialize_json(fargs.path_, arena, builder, func_schema))) {
               }
             } else if (is_parquet) {
-              if (OB_FAIL(file_sql_materialize_parquet(fargs.path_, arena, builder, first_schema))) {
+              if (OB_FAIL(file_sql_materialize_parquet(fargs.path_, arena, builder, func_schema))) {
               }
             } else {
               ret = file_sql_raise_not_supported("file table function");
@@ -1577,6 +1578,8 @@ static int file_sql_preprocess(const ObString &stmt,
             } else if (is_describe) {
               if (!has_schema) {
                 has_schema = true;
+                if (OB_FAIL(first_schema.columns_.assign(func_schema.columns_))) {
+                }
               }
             } else {
               if (OB_FAIL(out.append(text + last, static_cast<int32_t>(match.pos_ - last)))) {
