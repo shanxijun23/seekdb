@@ -786,26 +786,46 @@ static int file_sql_handle_enable_statement(const ObString &stmt,
         }
       }
     }
+  } else if (file_sql_trimmed_starts_with(text, len, "show", after)) {
+    // show [session|global] variables like/enable_file_sql
+    if (file_sql_contains_ci(text, len, "enable_file_sql")) {
+      if (OB_FAIL(rewritten.append_fmt(
+            "select 'enable_file_sql' as Variable_name, ifnull(@__file_sql_enabled, 0) as Value"))) {
+      } else {
+        handled = true;
+      }
+    }
   } else {
     // select @@session.enable_file_sql ...
     bool found = file_sql_contains_ci(text, len, "@@session.enable_file_sql")
-              || file_sql_contains_ci(text, len, "@@enable_file_sql");
+              || file_sql_contains_ci(text, len, "@@enable_file_sql")
+              || file_sql_contains_ci(text, len, "@@global.enable_file_sql");
     if (found) {
       int64_t last = 0;
       int64_t pos = -1;
       while (OB_SUCC(ret)) {
         int64_t p1 = -1;
         int64_t p2 = -1;
+        int64_t p3 = -1;
         bool has1 = file_sql_find_ci(text, len, last, "@@session.enable_file_sql", 25, p1);
         bool has2 = file_sql_find_ci(text, len, last, "@@enable_file_sql", 18, p2);
-        if (!has1 && !has2) {
+        bool has3 = file_sql_find_ci(text, len, last, "@@global.enable_file_sql", 24, p3);
+        if (!has1 && !has2 && !has3) {
           break;
         }
-        const bool use1 = (has1 && (!has2 || p1 <= p2));
-        pos = use1 ? p1 : p2;
-        const int32_t mlen = use1 ? 25 : 18;
+        int64_t best = -1;
+        int32_t mlen = 0;
+        const char *replacement = "ifnull(@__file_sql_enabled, 0)";
+        if (has1 && (-1 == best || p1 < best)) { best = p1; mlen = 25; }
+        if (has2 && (-1 == best || p2 < best)) { best = p2; mlen = 18; }
+        if (has3 && (-1 == best || p3 < best)) {
+          best = p3;
+          mlen = 24;
+          replacement = "0";
+        }
+        pos = best;
         if (OB_FAIL(rewritten.append(text + last, static_cast<int32_t>(pos - last)))) {
-        } else if (OB_FAIL(rewritten.append("ifnull(@__file_sql_enabled, 0)"))) {
+        } else if (OB_FAIL(rewritten.append(replacement))) {
         } else {
           last = pos + mlen;
         }
