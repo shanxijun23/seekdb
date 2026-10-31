@@ -299,6 +299,7 @@ END_P SET_VAR DELIMITER
         INVISIBLE MERGE ISNULL INTERSECT INCREMENTAL INNER_PARSE ILOGCACHE INPUT INDEXED INCONSISTENT INDIVIDUAL
 
         JOB JSON JSON_ARRAYAGG JSON_OBJECTAGG JSON_QUERY JSON_VALUE JSON_TABLE
+        READ_CSV READ_JSON READ_NDJSON READ_PARQUET GLOB
 
         KEYWORD KEY_BLOCK_SIZE KEY_VERSION KVCACHE
 
@@ -497,7 +498,7 @@ END_P SET_VAR DELIMITER
 %type <node> dynamic_sampling_hint
 %type <node> skip_index_type opt_skip_index_type_list
 %type <node> vec_index_params vec_index_param vec_index_param_value opt_with_vector_index_parameters
-%type <node> json_table_expr unnest_expr mock_jt_on_error_on_empty jt_column_list json_table_column_def
+%type <node> file_table_arg_list file_table_expr json_table_expr unnest_expr mock_jt_on_error_on_empty jt_column_list json_table_column_def
 %type <node> json_table_ordinality_column_def json_table_exists_column_def json_table_value_column_def json_table_nested_column_def
 %type <node> opt_value_on_empty_or_error_or_mismatch opt_on_mismatch
 %type <node> table_values_clause table_values_clause_with_order_by_and_limit values_row_list row_value
@@ -10734,6 +10735,64 @@ table_reference
 }
 ;
 
+file_table_arg_list:
+  expr
+  { $$ = $1; }
+| file_table_arg_list ',' expr
+  { malloc_non_terminal_node($$, result->malloc_pool_, T_EXPR_LIST, 2, $1, $3); }
+
+file_table_expr:
+  READ_CSV '(' file_table_arg_list ')' relation_name
+  {
+    malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 2, $3, $5);
+    if (NULL != $$) { $$->value_ = 1; }
+  }
+| READ_CSV '(' file_table_arg_list ')'
+  {
+    malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 1, $3);
+    if (NULL != $$) { $$->value_ = 1; }
+  }
+| READ_JSON '(' file_table_arg_list ')' relation_name
+  {
+    malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 2, $3, $5);
+    if (NULL != $$) { $$->value_ = 2; }
+  }
+| READ_JSON '(' file_table_arg_list ')'
+  {
+    malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 1, $3);
+    if (NULL != $$) { $$->value_ = 2; }
+  }
+| READ_NDJSON '(' file_table_arg_list ')' relation_name
+  {
+    malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 2, $3, $5);
+    if (NULL != $$) { $$->value_ = 3; }
+  }
+| READ_NDJSON '(' file_table_arg_list ')'
+  {
+    malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 1, $3);
+    if (NULL != $$) { $$->value_ = 3; }
+  }
+| READ_PARQUET '(' file_table_arg_list ')' relation_name
+  {
+    malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 2, $3, $5);
+    if (NULL != $$) { $$->value_ = 4; }
+  }
+| READ_PARQUET '(' file_table_arg_list ')'
+  {
+    malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 1, $3);
+    if (NULL != $$) { $$->value_ = 4; }
+  }
+| GLOB '(' file_table_arg_list ')' relation_name
+  {
+    malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 2, $3, $5);
+    if (NULL != $$) { $$->value_ = 5; }
+  }
+| GLOB '(' file_table_arg_list ')'
+  {
+    malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 1, $3);
+    if (NULL != $$) { $$->value_ = 5; }
+  }
+
 table_reference:
 table_factor
 {
@@ -10788,7 +10847,11 @@ table_factor
 ;
 
 table_factor:
-tbl_name
+file_table_expr
+{
+  $$ = $1;
+}
+| tbl_name
 {
   $$ = $1;
 }

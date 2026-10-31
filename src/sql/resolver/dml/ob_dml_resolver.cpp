@@ -707,7 +707,7 @@ int ObDMLResolver::pre_process_mvt_agg(ParseNode &node)
     } else if (OB_ISNULL(node.children_[0]->children_[2])) {
       ret = OB_ERR_UNEXPECTED;
     } else if (node.children_[0]->children_[2]->type_ != T_STAR) {
-      ret = OB_ERR_PARSER_SYNTAX;
+      ret = OB_ERR_PARSE_SQL;
     } else {
       ObQualifiedName column_ref;
       ObNameCaseMode case_mode = OB_NAME_CASE_INVALID;
@@ -2637,7 +2637,7 @@ int ObDMLResolver::resolve_table(const ParseNode &parse_tree,
       time_node = parse_tree.children_[5];
     }
     if (parse_tree.num_child_ >= 8 && OB_NOT_NULL(parse_tree.children_[7])) {
-      ret = OB_ERR_PARSER_SYNTAX;
+      ret = OB_ERR_PARSE_SQL;
     }
   }
   // Snapshot query does not support delete/update/insert statements.
@@ -2654,7 +2654,7 @@ int ObDMLResolver::resolve_table(const ParseNode &parse_tree,
       case T_SELECT: {
         bool has_snapshot_query = false;
         if (OB_ISNULL(alias_node)) {
-          ret = OB_ERR_PARSER_SYNTAX;
+          ret = OB_ERR_PARSE_SQL;
           LOG_WARN("generated table must have alias name");
         } else {
           bool tmp_have_same_table = params_.have_same_table_name_;
@@ -2705,6 +2705,18 @@ int ObDMLResolver::resolve_table(const ParseNode &parse_tree,
         OZ (resolve_json_table_item(*table_node, table_item));
         break;
       }
+      case T_FILE_TABLE_EXPRESSION: {
+        ParseNode *file_args = (table_node->num_child_ >= 1) ? table_node->children_[0] : NULL;
+        if (NULL != file_args && T_EXPR_LIST == file_args->type_ && 2 == file_args->num_child_
+            && NULL != file_args->children_[1]
+            && NULL != file_args->children_[1]->str_value_) {
+          ret = OB_ERR_PARSE_SQL;
+        } else {
+          ret = OB_NOT_SUPPORTED;
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "file table function");
+        }
+        break;
+      }
       case T_UNNEST_EXPRESSION: {
         if (OB_ISNULL(session_info_)) {
           ret = OB_INVALID_ARGUMENT;
@@ -2726,7 +2738,7 @@ int ObDMLResolver::resolve_table(const ParseNode &parse_tree,
       }
       default:
         /* won't be here */
-        ret = OB_ERR_PARSER_SYNTAX;
+        ret = OB_ERR_PARSE_SQL;
         LOG_WARN("Unknown table type", "node_type", table_node->type_);
         break;
       }
@@ -5192,7 +5204,7 @@ int ObDMLResolver::resolve_order_item(const ParseNode &sort_node, OrderItem &ord
   if (OB_FAIL(ret)) {
     // do nothing
   } else if (OB_UNLIKELY(sort_node.children_[0]->type_ == T_INT)) {
-    ret = OB_ERR_PARSER_SYNTAX;
+    ret = OB_ERR_PARSE_SQL;
     SQL_RESV_LOG(WARN, "index order item not support in update");
   } else if (OB_FAIL(resolve_sql_expr(*(sort_node.children_[0]), expr))) {
   } else {
@@ -5397,7 +5409,7 @@ int ObDMLResolver::resolve_limit_clause(const ParseNode *node, bool disable_offs
       int32_t str_len = static_cast<int32_t>(offset_node->text_len_);
       int32_t line_no = 1;
       LOG_WARN("can't set offset for limit clause in delete/update stmt");
-      LOG_USER_ERROR(OB_ERR_PARSE_SQL, ob_errpkt_strerror(OB_ERR_PARSER_SYNTAX),
+      LOG_USER_ERROR(OB_ERR_PARSE_SQL, ob_errpkt_strerror(OB_ERR_PARSE_SQL),
                     str_len, offset_node->raw_text_, line_no);
     // resolve the question mark with less value first
     } else if (limit_node != NULL && limit_node->type_ == T_QUESTIONMARK && offset_node != NULL
@@ -5466,7 +5478,7 @@ int ObDMLResolver::check_stmt_order_by(const ObSelectStmt *stmt)
     ret = OB_ERR_UNEXPECTED;
   } else {
     if (stmt->has_order_by()) {
-      ret = OB_ERR_PARSER_SYNTAX;
+      ret = OB_ERR_PARSE_SQL;
     } else if (stmt->is_set_stmt()) {
       ObSEArray<ObSelectStmt*, 2> child_stmts;
       if (OB_FAIL(stmt->get_child_stmts(child_stmts))) {
@@ -10830,7 +10842,7 @@ int ObDMLResolver::resolve_cte_table(
   }
   default:
     /* won't be here */
-    ret = OB_ERR_PARSER_SYNTAX;
+    ret = OB_ERR_PARSE_SQL;
     break;
   }
   return ret;
@@ -10947,7 +10959,7 @@ int ObDMLResolver::resolve_with_clause_subquery(const ParseNode &parse_tree, Tab
   ObSelectResolver *cur_select_resolver = NULL;
   if (OB_ISNULL(alias_node)) {
     /* It must be select statement.*/
-    ret = OB_ERR_PARSER_SYNTAX;
+    ret = OB_ERR_PARSE_SQL;
   } else if (OB_ISNULL(allocator_)) {
     ret = OB_NOT_INIT;
   } else if (OB_ISNULL(stmt)) {
